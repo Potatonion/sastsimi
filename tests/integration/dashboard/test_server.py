@@ -14,6 +14,7 @@ import pytest
 
 from sastsimi.contracts.ids import CommitId, RecordId, StoredDataId, WorkspaceId
 from sastsimi.contracts.refs import StoredDataRef
+from sastsimi.dashboard.query import DashboardQuery
 from sastsimi.dashboard.server import create_server
 from sastsimi.observability.agent_activity import ActivityKind, AgentActivityEvent
 from sastsimi.reporting.analysis_display_id import AnalysisDisplayIdStore
@@ -595,6 +596,75 @@ def test_server_downloads_only_current_manifest_files(tmp_path) -> None:
 def test_server_rejects_non_loopback_bind(tmp_path) -> None:
     with pytest.raises(ValueError, match="DASHBOARD_LOOPBACK_ONLY"):
         create_server(tmp_path, host="0.0.0.0", port=8765)
+
+
+def test_dashboard_shows_provider_timeout_without_output_artifact(tmp_path) -> None:
+    seed(tmp_path)
+    identity = CheckpointIdentity(
+        analysis_id="analysis-1",
+        workspace_id="workspace-1",
+        commit_id="commit-1",
+        hypothesis_id=None,
+    )
+    artifact = SimpleArtifactRepository(tmp_path, identity).put_json(
+        {"kind": "cursor_agent_attempt", "status": "CURSOR_TIMED_OUT"}
+    )
+    store = SimpleCheckpointStore(tmp_path / "db" / "sastsimi.sqlite3")
+    for analysis_id, attempt_id in (
+        ("analysis-1", "timeout-local"),
+        ("analysis-other", "timeout-other"),
+    ):
+        store.record_llm_attempt(
+            attempt_id=attempt_id,
+            analysis_id=analysis_id,
+            agent="test_agent",
+            model="test-model",
+            attempt_number=2,
+            status="CURSOR_TIMED_OUT",
+            elapsed_ms=600_000,
+            input_tokens=None,
+            output_tokens=None,
+            cost_cents=None,
+            artifact_ref=artifact,
+        )
+    with running_server(tmp_path) as base:
+        with urllib.request.urlopen(base + "/api/analyses/A-001") as response:
+            detail = json.load(response)
+    attempts = {item["invocation_id"]: item for item in detail["llm_invocations"]}
+    assert attempts["timeout-local"]["status"] == "CURSOR_TIMED_OUT"
+    assert attempts["timeout-local"]["elapsed_ms"] == 600_000
+    assert attempts["timeout-local"]["retry_count"] == 1
+    assert "timeout-other" not in attempts
+
+
+def test_dashboard_shows_active_llm_call_and_clears_it(tmp_path) -> None:
+    seed(tmp_path)
+    store = SimpleCheckpointStore(tmp_path / "db" / "sastsimi.sqlite3")
+    store.start_llm_call(
+        invocation_id="call-active",
+        analysis_id="analysis-1",
+        agent="test_agent",
+        model="test-model",
+        attempt_number=2,
+        started_at=datetime.now(UTC),
+    )
+    active_call = DashboardQuery(tmp_path).active_llm_call("analysis-1")
+    assert active_call is not None
+    assert active_call[:2] == ("test_agent", "test-model")
+    with running_server(tmp_path) as base:
+        with urllib.request.urlopen(base + "/api/analyses/A-001") as response:
+            active = json.load(response)
+        calls = {item["invocation_id"]: item for item in active["llm_invocations"]}
+        assert calls["call-active"]["status"] == "RUNNING"
+        assert calls["call-active"]["model"] == "test-model"
+        assert calls["call-active"]["attempt_number"] == 2
+        store.finish_llm_call(invocation_id="call-active", analysis_id="analysis-1")
+        assert DashboardQuery(tmp_path).active_llm_call("analysis-1") is None
+        with urllib.request.urlopen(base + "/api/analyses/A-001") as response:
+            finished = json.load(response)
+    assert "call-active" not in {
+        item["invocation_id"] for item in finished["llm_invocations"]
+    }
 
 
 def test_server_exposes_bounded_static_coverage_pages(tmp_path) -> None:

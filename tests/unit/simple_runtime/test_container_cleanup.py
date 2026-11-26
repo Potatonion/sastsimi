@@ -130,6 +130,35 @@ async def test_sweep_skips_foreign_and_unknown_owner() -> None:
     assert ("rm", "--force", "foreign") not in runtime.commands
 
 
+@pytest.mark.asyncio
+async def test_sweep_removes_orphan_when_ps_returns_a_short_id() -> None:
+    identity = _identity()
+    full_id = "a" * 64
+    short_id = full_id[:12]
+    dead = {**_labels(identity), "sastsimi.pid": "99999999"}
+
+    class _ShortIdDocker(_DeadOwnerDocker):
+        async def _run(
+            self,
+            args: Sequence[str],
+            *,
+            timeout_seconds: int,
+            input_bytes: bytes | None = None,
+        ) -> DockerCommandOutcome:
+            del timeout_seconds, input_bytes
+            self.commands.append(tuple(args))
+            if args[0] == "ps":
+                return DockerCommandOutcome(0, short_id.encode() + b"\n", b"", False)
+            return DockerCommandOutcome(0, b"", b"", False)
+
+    runtime = _ShortIdDocker({short_id: _state(full_id, dead)})
+
+    removed = await runtime.sweep_orphans()
+
+    assert removed == (short_id,)
+    assert ("rm", "--force", short_id) in runtime.commands
+
+
 def test_unknown_windows_pid_cannot_be_swept() -> None:
     assert PortableDockerRuntime._pid_known_dead(99999999, platform_name="nt") is False
 

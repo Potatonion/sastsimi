@@ -119,6 +119,11 @@ class DashboardQuery:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def check_database(self) -> None:
+        """Fail before serving a dashboard pointed at a missing database."""
+        with self._connect() as connection:
+            connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+
     @staticmethod
     def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
         return (
@@ -586,6 +591,8 @@ class DashboardQuery:
             )
         )
         invocations = self._llm_invocations(events, contents, sources, values)
+        invocations += self._failed_llm_attempts(analysis_id, run)
+        invocations += self._inflight_llm_calls(analysis_id, run)
         poc_ids = tuple(
             item.artifact_id
             for item in artifacts
@@ -767,6 +774,94 @@ class DashboardQuery:
                 )
             )
         return tuple(result)
+
+    def _failed_llm_attempts(
+        self, analysis_id: str, run: SimpleAnalysisRun
+    ) -> tuple[LLMInvocationView, ...]:
+        # Provider failures have no successful output artifact or stage event.
+        # Read only diagnostic metadata, never raw prompts or responses.
+        with self._connect() as connection:
+            if not self._table_exists(connection, "simple_llm_attempts"):
+                return ()
+            rows = connection.execute(
+                """
+                SELECT attempt_id, agent, model, attempt_number, status,
+                       elapsed_ms, input_tokens, output_tokens
+                FROM simple_llm_attempts
+                WHERE analysis_id = ? AND status != 'SUCCEEDED'
+                ORDER BY rowid DESC LIMIT 200
+                """,
+                (analysis_id,),
+            ).fetchall()
+        return tuple(
+            LLMInvocationView(
+                invocation_id=row["attempt_id"],
+                agent_role=row["agent"],
+                provider=run.llm_provider or run.provider or "미확인",
+                model=row["model"],
+                stage="LLM_CALL",
+                status=row["status"],
+                elapsed_ms=row["elapsed_ms"],
+                input_tokens=row["input_tokens"],
+                output_tokens=row["output_tokens"],
+                attempt_number=row["attempt_number"],
+                retry_count=max(0, row["attempt_number"] - 1),
+            )
+            for row in rows
+        )
+
+    def _inflight_llm_calls(
+        self, analysis_id: str, run: SimpleAnalysisRun
+    ) -> tuple[LLMInvocationView, ...]:
+        with self._connect() as connection:
+            if not self._table_exists(connection, "simple_llm_inflight"):
+                return ()
+            rows = connection.execute(
+                """
+                SELECT invocation_id, agent, model, attempt_number, started_at
+                FROM simple_llm_inflight WHERE analysis_id = ?
+                ORDER BY started_at DESC LIMIT 32
+                """,
+                (analysis_id,),
+            ).fetchall()
+        now = datetime.now(UTC)
+        return tuple(
+            LLMInvocationView(
+                invocation_id=row["invocation_id"],
+                agent_role=row["agent"],
+                provider=run.llm_provider or run.provider or "미확인",
+                model=row["model"],
+                stage="LLM_CALL",
+                status="RUNNING",
+                started_at=(started := datetime.fromisoformat(row["started_at"])),
+                elapsed_ms=max(0, int((now - started).total_seconds() * 1000)),
+                attempt_number=row["attempt_number"],
+                retry_count=max(0, row["attempt_number"] - 1),
+            )
+            for row in rows
+        )
+
+    def active_llm_call(self, analysis_id: str) -> tuple[str, str, int] | None:
+        """Return a small, prompt-free heartbeat for the CLI."""
+        with self._connect() as connection:
+            if not self._table_exists(connection, "simple_llm_inflight"):
+                return None
+            row = connection.execute(
+                "SELECT agent, model, started_at FROM simple_llm_inflight "
+                "WHERE analysis_id = ? ORDER BY started_at DESC LIMIT 1",
+                (analysis_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        elapsed = max(
+            0,
+            int(
+                (
+                    datetime.now(UTC) - datetime.fromisoformat(row["started_at"])
+                ).total_seconds()
+            ),
+        )
+        return str(row["agent"]), str(row["model"]), elapsed
 
     def report_path(self, analysis_id: str, display_id: str) -> Path:
         self._validate_analysis_id(analysis_id)

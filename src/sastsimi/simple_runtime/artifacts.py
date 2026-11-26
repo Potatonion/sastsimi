@@ -38,6 +38,24 @@ from .models import (
 )
 
 _MAX_CONTEXT_BYTES = 256 * 1024
+_MAX_PROMPT_TEXT_CHARS = 8 * 1024
+
+
+def _chunk_long_prompt_strings(value: Any) -> Any:
+    """Keep large inputs complete while allowing bounded CLI prompt arguments."""
+    if isinstance(value, str) and len(value) > _MAX_PROMPT_TEXT_CHARS:
+        return {
+            "text_chunks": [
+                value[index : index + _MAX_PROMPT_TEXT_CHARS]
+                for index in range(0, len(value), _MAX_PROMPT_TEXT_CHARS)
+            ],
+            "join_without_separator": True,
+        }
+    if isinstance(value, dict):
+        return {key: _chunk_long_prompt_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_chunk_long_prompt_strings(item) for item in value]
+    return value
 
 
 class SimpleArtifactRepository:
@@ -396,13 +414,17 @@ class SimpleArtifactRepository:
             raise ValueError("BUNDLE_MANIFEST_CHANGED")
         return bundle_dir
 
-    def prompt_context(self, refs: tuple[StoredDataRef, ...]) -> bytes:
+    def prompt_context(
+        self, refs: tuple[StoredDataRef, ...], *, max_bytes: int = _MAX_CONTEXT_BYTES
+    ) -> bytes:
+        if not 0 < max_bytes <= _MAX_CONTEXT_BYTES:
+            raise ValueError("SIMPLE_RUNTIME_CONTEXT_LIMIT_INVALID")
         items: list[dict[str, Any]] = []
         used = 0
         for ref in refs:
             raw = self.read(ref)
             redacted = self._redacted(raw)
-            remaining = _MAX_CONTEXT_BYTES - used
+            remaining = max_bytes - used
             if remaining <= 0:
                 break
             redacted = redacted[:remaining]
@@ -411,6 +433,7 @@ class SimpleArtifactRepository:
                 data: Any = json.loads(redacted)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 data = redacted.decode("utf-8", errors="replace")
+            data = _chunk_long_prompt_strings(data)
             item: dict[str, Any] = {
                 "reference": ref.model_dump(mode="json"),
                 "data": data,

@@ -19,6 +19,7 @@ from .models import (
     StageResult,
     StageStatus,
     input_reference_hash,
+    terminal_candidate_outcome,
     terminal_gate_outcome,
     terminal_poc_outcome,
 )
@@ -98,14 +99,18 @@ class SimpleRuntimeRunner:
                 ):
                     continue
                 existing = self.store.get(identity, stage)
+                stale_input_refs: tuple[StoredDataRef, ...] = ()
                 if (
                     existing is not None
                     and existing.stage_version != STAGE_VERSION[stage]
                 ):
+                    stale_input_refs = existing.input_refs
                     self.store.invalidate_from(
                         identity, stage, new_inputs=existing.input_refs
                     )
                     existing = None
+                if terminal_candidate_outcome(existing) is not None:
+                    return RunOutcome(current_stage=stage, status=StageStatus.SUCCEEDED)
                 if self.recovery is not None and existing is not None:
                     recovery_outcome = await self._recover_existing(existing)
                     if recovery_outcome is False:
@@ -116,6 +121,11 @@ class SimpleRuntimeRunner:
                     else:
                         return recovery_outcome
                 input_refs = self.store.input_refs_for(identity, stage)
+                if not input_refs and stale_input_refs:
+                    # A child PRO_CON seed has no completed child predecessor.
+                    # Preserve its selected hypothesis and static-bundle refs
+                    # when migrating an older stage version.
+                    input_refs = stale_input_refs
                 if (
                     stage is SimpleStage.SCOPE_GATE_DONE
                     and existing is None
@@ -209,6 +219,16 @@ class SimpleRuntimeRunner:
                     )
                     raise
                 except StageBlocked as error:
+                    if (
+                        stage is SimpleStage.POC_CANDIDATE_DONE
+                        and error.failure.code == "POC_MODEL_REFUSED"
+                    ):
+                        self.store.mark_failure(
+                            checkpoint, error.failure, StageStatus.BLOCKED
+                        )
+                        return RunOutcome(
+                            current_stage=stage, status=StageStatus.SUCCEEDED
+                        )
                     outcome = await self._recover_or_stop(
                         checkpoint,
                         error.failure,

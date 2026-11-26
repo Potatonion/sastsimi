@@ -10,6 +10,7 @@ from sastsimi.simple_runtime.models import (
     SimpleStage,
     StageCheckpoint,
     StageStatus,
+    terminal_candidate_outcome,
     terminal_gate_outcome,
     terminal_poc_outcome,
 )
@@ -85,7 +86,22 @@ class ProgressProjector:
                 None,
             )
             gate_outcome = terminal_gate_outcome(gate)
-            if terminal_poc_outcome(execution) is not None:
+            candidate = next(
+                (
+                    item
+                    for item in values
+                    if item.stage is SimpleStage.POC_CANDIDATE_DONE
+                ),
+                None,
+            )
+            if terminal_candidate_outcome(candidate) is not None:
+                candidate_index = HYPOTHESIS_STAGES.index(
+                    SimpleStage.POC_CANDIDATE_DONE
+                )
+                skipped += len(HYPOTHESIS_STAGES[candidate_index + 1 :])
+                terminal_hypotheses += 1
+                inconclusive_hypotheses += 1
+            elif terminal_poc_outcome(execution) is not None:
                 execution_index = HYPOTHESIS_STAGES.index(
                     SimpleStage.POC_EXECUTION_DONE
                 )
@@ -169,7 +185,11 @@ class ProgressProjector:
         # An active stage is the current analysis, even when an earlier
         # hypothesis has already stopped. Once idle, failed outranks blocked.
         for status in (StageStatus.RUNNING, StageStatus.FAILED, StageStatus.BLOCKED):
-            matches = [item for item in checkpoints if item.status is status]
+            matches = [
+                item
+                for item in checkpoints
+                if item.status is status and terminal_candidate_outcome(item) is None
+            ]
             if matches:
                 result_status: Literal["BLOCKED", "FAILED", "RUNNING"] = (
                     "BLOCKED"
@@ -181,7 +201,12 @@ class ProgressProjector:
                 return result_status, max(matches, key=lambda item: item.updated_at)
         if hypothesis_count > 0 and terminal_hypotheses == hypothesis_count:
             return (
-                "PARTIAL" if static_disposition == "PARTIAL" else "COMPLETE"
+                "PARTIAL"
+                if static_disposition == "PARTIAL"
+                or any(
+                    terminal_candidate_outcome(item) is not None for item in checkpoints
+                )
+                else "COMPLETE"
             ), current
         return "RUNNING", current
 

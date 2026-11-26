@@ -18,7 +18,10 @@ from .models import MAX_RECOVERY_ATTEMPTS, SimpleStage, StageCheckpoint, StageFa
 from .provider import SimpleLLMClient
 
 _MAX_ENVIRONMENT_PATCH_BYTES = 8 * 1024
-_RECOVERY_TIMEOUT_MS = 120_000
+_RECOVERY_TIMEOUT_MS = 300_000
+# Cursor CLI passes the complete prompt as one OS argument. Linux limits a
+# single argument to 128 KiB even when ARG_MAX is much larger.
+_MAX_RECOVERY_PROMPT_BYTES = 96 * 1024
 _PLAYWRIGHT_BROWSERS = ("chromium", "firefox", "webkit")
 _PLAYWRIGHT_PATCH_PREFIX = (
     "ENV PLAYWRIGHT_BROWSERS_PATH=/opt/sastsimi-playwright-browsers\n"
@@ -193,6 +196,94 @@ class SimpleRecoveryCoordinator:
                 ),
             )
 
+        if failure.code == "CURSOR_TIMED_OUT":
+            # The provider already spent its complete call deadline, including
+            # internal retries. Repeating an unchanged request automatically
+            # can hold the run for many more minutes without new evidence.
+            return self._store(
+                checkpoint,
+                failure,
+                self._stop(
+                    "Cursor did not complete within the configured call deadline",
+                    "inspect the model call and retry manually after a change",
+                ),
+            )
+
+        if failure.code == "DOCKER_DAEMON_UNAVAILABLE":
+            return self._store(
+                checkpoint,
+                failure,
+                self._stop(
+                    "Docker daemon is unavailable",
+                    "start Docker in the analysis environment, then retry manually",
+                ),
+            )
+
+        if failure.code == "DOCKER_POC_MATERIALIZATION_FAILED":
+            return self._store(
+                checkpoint,
+                failure,
+                self._stop(
+                    "Docker could not copy the PoC into the container",
+                    "inspect the container state or Docker runtime, then resume",
+                ),
+            )
+
+        if checkpoint.stage is SimpleStage.REPORT_DONE and failure.code in {
+            "STAGE_UNEXPECTED_ERROR",
+            "REPORT_UNSUPPORTED_METADATA_CLAIM",
+            "REPORT_CODE_LOCATION_UNSUPPORTED",
+            "REPORT_HIDDEN_REASONING_DENIED",
+            "REPORT_LANGUAGE_REQUIRED",
+        }:
+            # A report content check used to escape as an unexpected exception.
+            # Retry the reporter; the stage itself corrects the draft.
+            return self._store(
+                checkpoint,
+                failure,
+                RecoveryDecision(
+                    category=RecoveryCategory.GENERATED_INPUT,
+                    action=RecoveryAction.RETRY_STAGE,
+                    diagnosis="Report draft failed a local content check",
+                    guidance=(
+                        "Retry the reporter without version, CVSS, severity, "
+                        "disclosure, or unverified path citations"
+                    ),
+                ),
+            )
+
+        if failure.code in {"STAGE_CANCELLED", "STAGE_INTERRUPTED"}:
+            # An operator stop or process interruption supplies no new
+            # diagnostic evidence for a recovery LLM. Reopen the same stage;
+            # the checkpoint attempt limit still bounds repeated restarts.
+            return self._store(
+                checkpoint,
+                failure,
+                RecoveryDecision(
+                    category=RecoveryCategory.TRANSIENT_TOOL,
+                    action=RecoveryAction.RETRY_STAGE,
+                    diagnosis="Stage execution was interrupted",
+                    guidance="Resume the interrupted stage from saved checkpoints",
+                ),
+            )
+
+        if failure.code == "CURSOR_CLI_NOT_INSTALLED" and checkpoint.stage in {
+            SimpleStage.STATIC_DONE,
+            SimpleStage.HYPOTHESIS_DONE,
+        }:
+            # Construction of the recovery client already established that the
+            # CLI is now present. Retry the exact stage without an LLM call.
+            return self._store(
+                checkpoint,
+                failure,
+                RecoveryDecision(
+                    category=RecoveryCategory.TRANSIENT_TOOL,
+                    action=RecoveryAction.RETRY_STAGE,
+                    diagnosis="Cursor CLI is now available",
+                    guidance="Retry the blocked bootstrap stage",
+                ),
+            )
+
         missing_browser = self._missing_playwright_browser(checkpoint, failure)
         if missing_browser is not None:
             return self._store(
@@ -221,15 +312,15 @@ class SimpleRecoveryCoordinator:
                     action=RecoveryAction.REGENERATE_INPUT,
                     diagnosis="PoC runtime write was denied inside the container",
                     guidance=(
-                        "Keep /workspace read-only; configure application runtime "
-                        "storage and scratch paths under /tmp before startup"
+                        "Existing /workspace files are immutable. Let the application "
+                        "create a new runtime directory beside them, put other scratch "
+                        "data under /tmp, and do not chmod or edit source files"
                     ),
                 ),
             )
 
         refs = tuple(dict.fromkeys(checkpoint.input_refs + failure.evidence_refs))
-        context = self._artifacts.prompt_context(refs)
-        prompt = b"\n".join(
+        prefix = b"\n".join(
             (
                 b"Classify one failed SimpleRuntime stage and choose one "
                 b"bounded action.",
@@ -245,9 +336,24 @@ class SimpleRecoveryCoordinator:
                         "safe_message": failure.safe_message,
                     }
                 ),
-                context,
             )
         )
+        context_limit = 16 * 1024
+        while True:
+            context = self._artifacts.prompt_context(refs, max_bytes=context_limit)
+            prompt = prefix + b"\n" + context
+            if len(prompt) <= _MAX_RECOVERY_PROMPT_BYTES:
+                break
+            if context_limit <= 1024:
+                return self._store(
+                    checkpoint,
+                    failure,
+                    self._stop(
+                        "recovery context exceeds the CLI prompt limit",
+                        "preserve the failure for manual review",
+                    ),
+                )
+            context_limit //= 2
         try:
             response = await self._client.call(
                 prompt=prompt,

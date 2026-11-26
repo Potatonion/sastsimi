@@ -210,8 +210,18 @@ class SystemToolDiscovery:
         )
         if completed.returncode != 0 or not version or len(version) > 160:
             return ToolInspection(name="cursor_agent", available=False)
-        versions = Path(launcher).parent / "versions"
-        native = versions / version / "node.exe"
+        if os.name == "nt":
+            native = Path(launcher).parent / "versions" / version / "node.exe"
+        else:
+            # Linux installs a symlink to the versioned launcher and bundles
+            # its native node executable alongside that launcher.
+            versioned_launcher = Path(launcher).resolve()
+            if (
+                versioned_launcher.name != "cursor-agent"
+                or versioned_launcher.parent.name != version
+            ):
+                return ToolInspection(name="cursor_agent", available=False)
+            native = versioned_launcher.parent / "node"
         script = native.with_name("index.js")
         if not native.is_file() or not script.is_file():
             return ToolInspection(name="cursor_agent", available=False)

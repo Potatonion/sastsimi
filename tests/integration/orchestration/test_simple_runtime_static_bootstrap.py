@@ -460,6 +460,74 @@ async def test_completed_static_scope_fingerprint_rejects_dirty_checkout(
         await bootstrap.coverage_fingerprint(request, identity)
 
 
+@pytest.mark.asyncio
+async def test_jvm_crash_logs_are_preserved_outside_checkout(
+    tmp_path: Path,
+) -> None:
+    class CrashLogProcess(_Process):
+        async def run(
+            self,
+            argv: Sequence[str],
+            *,
+            cwd: Path | None = None,
+            timeout_seconds: int,
+        ) -> ProcessResult:
+            if argv[1] == "status":
+                assert cwd is not None
+                names = ("hs_err_pid123.log", "replay_pid123.log")
+                entries = [b"?? .sastsimi-ready.json\0"]
+                entries.extend(
+                    f"?? {name}\0".encode()
+                    for name in names
+                    if (cwd / name).exists()
+                )
+                return ProcessResult(0, b"".join(entries), b"")
+            return await super().run(argv, cwd=cwd, timeout_seconds=timeout_seconds)
+
+    profile = _profile(tmp_path)
+    request = _request(profile)
+    workspace = _ready_workspace(tmp_path, request)
+    (workspace / "hs_err_pid123.log").write_text("JVM crash details")
+    (workspace / "replay_pid123.log").write_text("replay details")
+    bootstrap = DirectStaticBootstrap(
+        profile=profile,
+        process=CrashLogProcess(),
+        store=_store(profile),
+        static_material_root=tmp_path,
+    )
+
+    await bootstrap._verify_opengrep_workspace(workspace, request)
+
+    archive = profile.data_dir / "process-output" / "jvm-crashes" / workspace.name
+    assert not (workspace / "hs_err_pid123.log").exists()
+    assert not (workspace / "replay_pid123.log").exists()
+    assert [path.read_text() for path in archive.glob("*-hs_err_pid123.log")] == [
+        "JVM crash details"
+    ]
+    assert [path.read_text() for path in archive.glob("*-replay_pid123.log")] == [
+        "replay details"
+    ]
+
+
+def test_only_root_untracked_jvm_crash_logs_are_archived(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "hs_err_pid123.log").write_text("crash")
+    (workspace / "other.log").write_text("user file")
+
+    changed = DirectStaticBootstrap._archive_untracked_jvm_crash_logs(
+        workspace,
+        tmp_path / "data",
+        b"?? nested/hs_err_pid321.log\0?? other.log\0?? hs_err_pid123.log\0",
+    )
+
+    assert changed
+    assert (workspace / "other.log").read_text() == "user file"
+    assert (workspace / "hs_err_pid123.log").exists() is False
+    archive = tmp_path / "data" / "process-output" / "jvm-crashes" / workspace.name
+    assert not (archive / "other.log").exists()
+
+
 class _Process:
     async def run(
         self,

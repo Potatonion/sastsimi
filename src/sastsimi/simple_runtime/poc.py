@@ -15,6 +15,15 @@ _SHELL_ASSIGNMENT = re.compile(
     rb"(?m)^[ \t]*(?:export[ \t]+|readonly[ \t]+)?"
     rb"(?P<name>[A-Za-z_][A-Za-z0-9_]*)="
 )
+_SHELL_FOR_BINDING = re.compile(
+    rb"(?m)^[ \t]*for[ \t]+(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    rb"[ \t]+in(?:[ \t;]|$)"
+)
+_SHELL_READ_BINDING = re.compile(
+    rb"(?m)^[ \t]*(?:while[ \t]+)?(?:IFS=[^ \t\r\n]*[ \t]+)?"
+    rb"read[ \t]+(?:-r[ \t]+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    rb"(?=[ \t;]|$)"
+)
 _URL = re.compile(rb"https?://[^\s'\"<>]+", re.IGNORECASE)
 _WINDOWS_PATH = re.compile(rb"(?:(?<![A-Za-z0-9_])[A-Za-z]:[\\/]|\\\\)[^\r\n]+")
 _FORBIDDEN_HOST_PATHS = (
@@ -54,7 +63,12 @@ def validate_candidate(
             raise PoCCandidateRejected("POC_EXTERNAL_URL_FORBIDDEN")
     declared = {
         match.group("name").decode("ascii")
-        for match in _SHELL_ASSIGNMENT.finditer(content)
+        for pattern in (
+            _SHELL_ASSIGNMENT,
+            _SHELL_FOR_BINDING,
+            _SHELL_READ_BINDING,
+        )
+        for match in pattern.finditer(content)
     }
     allowed = _SAFE_PROCESS_VARIABLES | allowed_environment_names | declared
     variables = {

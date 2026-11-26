@@ -40,6 +40,10 @@ STAGE_VERSION: dict[SimpleStage, str] = {
         if stage is SimpleStage.VERIFICATION_INITIAL_DONE
         else "4"
         if stage is SimpleStage.REPORT_DONE
+        else "3"
+        if stage is SimpleStage.POC_CANDIDATE_DONE
+        else "2"
+        if stage is SimpleStage.PRO_CON_DONE
         else "2"
         if stage
         in {
@@ -171,6 +175,21 @@ def terminal_poc_outcome(
         and checkpoint.attempt_number >= MAX_RECOVERY_ATTEMPTS
         and checkpoint.validated_poc_ref is None
         and len(checkpoint.output_refs) >= 2
+    ):
+        return "INCONCLUSIVE"
+    return None
+
+
+def terminal_candidate_outcome(
+    checkpoint: StageCheckpoint | None,
+) -> Literal["INCONCLUSIVE"] | None:
+    """An ungenerated candidate is unverified, not a reproduction."""
+    if (
+        checkpoint is not None
+        and checkpoint.stage is SimpleStage.POC_CANDIDATE_DONE
+        and checkpoint.stage_version == STAGE_VERSION[SimpleStage.POC_CANDIDATE_DONE]
+        and checkpoint.status is StageStatus.BLOCKED
+        and checkpoint.error_code == "POC_MODEL_REFUSED"
     ):
         return "INCONCLUSIVE"
     return None

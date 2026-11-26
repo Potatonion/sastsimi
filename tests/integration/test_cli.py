@@ -95,6 +95,8 @@ def test_config_error_and_internal_error_do_not_leak(
     event = json.loads(output.err.splitlines()[0])
     assert event["event"] == "internal_error"
     assert event["fields"]["error_type"] == "RuntimeError"
+    assert event["fields"]["error_frames"]
+    assert all("/" not in frame for frame in event["fields"]["error_frames"])
 
 
 def test_pre_dispatch_error_names_the_requested_command(

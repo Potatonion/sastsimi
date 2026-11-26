@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from io import StringIO
 from pathlib import Path
 from typing import Literal, cast
+from unittest.mock import patch
 
 from sastsimi.interfaces.cli.progress import ProgressEvent, ProgressRenderer
 from sastsimi.progress.models import ProgressSnapshot
@@ -68,6 +69,51 @@ def test_non_tty_progress_only_emits_stage_transitions() -> None:
 
     assert stream.getvalue().count("PRO_CON_DONE") == 1
     assert stream.getvalue().count("POC_EXECUTION_DONE") == 1
+
+
+def test_waiting_heartbeat_does_not_increment_progress() -> None:
+    stream = StringIO()
+    with patch("sastsimi.interfaces.cli.progress.monotonic", return_value=0) as clock:
+        renderer = ProgressRenderer(stream=stream, is_tty=False)
+        snapshot = _snapshot(20)
+        renderer.render(snapshot)
+        clock.return_value = 30
+        renderer.render(snapshot)
+        clock.return_value = 60
+        renderer.render(snapshot)
+    output = stream.getvalue()
+    assert "진척 변경 없이 대기 30초" in output
+    assert "진척 변경 없이 대기 60초" in output
+    assert snapshot.percent == 20
+
+
+def test_waiting_heartbeat_identifies_active_llm_call() -> None:
+    stream = StringIO()
+    with patch("sastsimi.interfaces.cli.progress.monotonic", return_value=0) as clock:
+        renderer = ProgressRenderer(
+            stream=stream,
+            is_tty=False,
+            active_call_reader=lambda _analysis_id: (
+                "pro_evidence",
+                "grok-4.7-xhigh",
+                48,
+            ),
+        )
+        snapshot = _snapshot(20)
+        renderer.render(snapshot)
+        clock.return_value = 30
+        renderer.render(snapshot)
+    assert "LLM pro_evidence / grok-4.7-xhigh 호출 48초" in stream.getvalue()
+
+
+def test_waiting_timer_resets_when_progress_changes() -> None:
+    stream = StringIO()
+    with patch("sastsimi.interfaces.cli.progress.monotonic", return_value=0) as clock:
+        renderer = ProgressRenderer(stream=stream, is_tty=True)
+        renderer.render(_snapshot(20))
+        clock.return_value = 60
+        renderer.render(_snapshot(30))
+    assert "대기 60초" not in stream.getvalue()
 
 
 def test_progress_is_appended_to_analysis_log_without_terminal_coloring(

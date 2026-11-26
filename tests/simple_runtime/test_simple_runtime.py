@@ -7,6 +7,7 @@ import pytest
 from sastsimi.contracts.ids import CommitId, RecordId, StoredDataId, WorkspaceId
 from sastsimi.contracts.refs import StoredDataRef
 from sastsimi.observability.agent_activity import ActivityKind
+from sastsimi.progress.projector import ProgressProjector
 from sastsimi.simple_runtime.artifacts import SimpleArtifactRepository
 from sastsimi.simple_runtime.models import (
     HYPOTHESIS_STAGES,
@@ -33,6 +34,108 @@ from sastsimi.simple_runtime.runner import (
 from sastsimi.simple_runtime.stages import internal_report_status
 from sastsimi.simple_runtime.store import SimpleCheckpointStore
 from sastsimi.storage.agent_activity import AgentActivityStore
+
+
+@pytest.mark.asyncio
+async def test_candidate_timeout_stays_blocked_for_operator_retry(
+    tmp_path,
+) -> None:
+    store = SimpleCheckpointStore(tmp_path / "state.sqlite3")
+    _seeded_through(store, SimpleStage.VERIFICATION_INITIAL_DONE)
+    calls = 0
+
+    async def timeout_candidate(checkpoint, prior):
+        nonlocal calls
+        calls += 1
+        raise StageBlocked(
+            StageFailure(
+                code="CURSOR_TIMED_OUT",
+                retryable=True,
+                safe_message="PoC candidate generation timed out",
+            )
+        )
+
+    runner = SimpleRuntimeRunner(
+        store, {SimpleStage.POC_CANDIDATE_DONE: timeout_candidate}
+    )
+    first = await runner.resume_hypothesis(_identity())
+    assert first.status is StageStatus.BLOCKED
+    assert calls == 1
+    candidate = store.require(_identity(), SimpleStage.POC_CANDIDATE_DONE)
+    assert candidate.status is StageStatus.BLOCKED
+    assert candidate.error_code == "CURSOR_TIMED_OUT"
+    snapshot = ProgressProjector(store).snapshot(_identity().analysis_id)
+    assert snapshot.status == "BLOCKED"
+    assert snapshot.inconclusive_hypothesis_count == 0
+
+
+@pytest.mark.asyncio
+async def test_candidate_refusal_is_unverified_terminal_with_evidence(tmp_path) -> None:
+    store = SimpleCheckpointStore(tmp_path / "state.sqlite3")
+    _seeded_through(store, SimpleStage.VERIFICATION_INITIAL_DONE)
+    refusal_ref = _ref("model-refusal")
+    calls = 0
+
+    async def refuse_candidate(checkpoint, prior):
+        nonlocal calls
+        calls += 1
+        raise StageBlocked(
+            StageFailure(
+                code="POC_MODEL_REFUSED",
+                retryable=False,
+                safe_message="Model declined local PoC generation",
+                evidence_refs=(refusal_ref,),
+            )
+        )
+
+    runner = SimpleRuntimeRunner(
+        store, {SimpleStage.POC_CANDIDATE_DONE: refuse_candidate}
+    )
+    first = await runner.resume_hypothesis(_identity())
+    second = await runner.resume_hypothesis(_identity())
+
+    assert first.status is StageStatus.SUCCEEDED
+    assert second.status is StageStatus.SUCCEEDED
+    assert calls == 1
+    candidate = store.require(_identity(), SimpleStage.POC_CANDIDATE_DONE)
+    assert candidate.status is StageStatus.BLOCKED
+    assert candidate.error_code == "POC_MODEL_REFUSED"
+    assert candidate.output_refs == (refusal_ref,)
+    snapshot = ProgressProjector(store).snapshot(_identity().analysis_id)
+    assert snapshot.status == "PARTIAL"
+    assert snapshot.inconclusive_hypothesis_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_pro_con_keeps_selected_hypothesis_inputs(tmp_path) -> None:
+    store = SimpleCheckpointStore(tmp_path / "state.sqlite3")
+    inputs = (_ref("selected-hypothesis"), _ref("static-bundle"))
+    store.save_checkpoint(
+        StageCheckpoint(
+            identity=_identity(),
+            stage=SimpleStage.PRO_CON_DONE,
+            stage_version="1",
+            status=StageStatus.PENDING,
+            input_refs=inputs,
+            input_hash=input_reference_hash(inputs),
+        )
+    )
+    observed: list[tuple[StoredDataRef, ...]] = []
+
+    async def inspect(checkpoint, prior):
+        observed.append(checkpoint.input_refs)
+        raise StageBlocked(
+            StageFailure(
+                code="TEST_STOP",
+                retryable=False,
+                safe_message="stop after inspection",
+            )
+        )
+
+    await SimpleRuntimeRunner(
+        store, {SimpleStage.PRO_CON_DONE: inspect}
+    ).resume_hypothesis(_identity())
+    assert observed == [inputs]
 
 
 def _ref(name: str) -> StoredDataRef:
@@ -201,6 +304,43 @@ async def test_resume_reuses_exact_success_and_invalidates_changed_downstream(
     assert SimpleStage.STATIC_DONE not in calls
     assert SimpleStage.HYPOTHESIS_DONE not in calls
     assert outcome.current_stage is SimpleStage.REPORT_DONE
+
+
+def test_rerun_of_same_poc_attempt_records_a_new_stage_start(tmp_path) -> None:
+    store = SimpleCheckpointStore(tmp_path / "db" / "sastsimi.sqlite3")
+    _seeded_through(store, SimpleStage.VERIFICATION_INITIAL_DONE)
+    candidate_inputs = store.input_refs_for(
+        _identity(),
+        SimpleStage.POC_CANDIDATE_DONE,
+    )
+    attempt_id = "poc-attempt-same"
+    store.save_success(
+        _checkpoint(
+            SimpleStage.POC_CANDIDATE_DONE,
+            inputs=candidate_inputs,
+            attempt_id=attempt_id,
+        ),
+        outputs=(_ref("candidate-same"),),
+    )
+    inherit = store.require(_identity(), SimpleStage.POC_CANDIDATE_DONE)
+    store.mark_running(
+        _identity(),
+        SimpleStage.POC_EXECUTION_DONE,
+        (_ref("candidate-same"),),
+        attempt_id=attempt_id,
+        inherit_from=inherit,
+    )
+
+    restarted = store.mark_running(
+        _identity(),
+        SimpleStage.POC_EXECUTION_DONE,
+        (_ref("candidate-same"),),
+        attempt_id=attempt_id,
+        inherit_from=inherit,
+    )
+
+    assert restarted.attempt_id == attempt_id
+    assert restarted.status is StageStatus.RUNNING
 
 
 @pytest.mark.asyncio
@@ -546,6 +686,7 @@ async def test_restart_does_not_grant_fourth_attempt(tmp_path) -> None:
         StageCheckpoint(
             identity=_identity(),
             stage=SimpleStage.PRO_CON_DONE,
+            stage_version=STAGE_VERSION[SimpleStage.PRO_CON_DONE],
             status=StageStatus.BLOCKED,
             input_refs=inputs,
             input_hash=input_reference_hash(inputs),

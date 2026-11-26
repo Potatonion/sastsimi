@@ -12,7 +12,15 @@ class PublicCommandApplication(Protocol):
 
     def resume(self, analysis_id: str) -> dict[str, object]: ...
 
-    def retry(self, analysis_id: str) -> dict[str, object]: ...
+    def retry(
+        self,
+        analysis_id: str,
+        *,
+        all_poc_timeouts: bool = False,
+        rebuild_environment: bool = False,
+        hypothesis_ids: tuple[str, ...] = (),
+        allow_terminal_retry: bool = False,
+    ) -> dict[str, object]: ...
 
     def result(self, analysis_id: str) -> dict[str, object]: ...
 

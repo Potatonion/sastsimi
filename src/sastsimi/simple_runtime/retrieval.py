@@ -19,6 +19,8 @@ from .facts import safe_tracked_file
 
 _SPAN = re.compile(r"^(?P<path>[^:]+):(?P<start>\d+)(?:-(?P<end>\d+))?$")
 _MAX_TOTAL_BYTES = 256_000
+_MAX_EXCERPT_SOURCE_BYTES = 1_048_576
+_MIN_EXCERPT_BYTES = 256
 
 
 def collect_requested_sources(
@@ -32,11 +34,14 @@ def collect_requested_sources(
     git_executable: str = "git",
     max_requests: int | None = None,
     max_artifact_bytes: int | None = None,
+    max_file_bytes: int | None = None,
 ) -> dict[str, Any]:
     if max_requests is not None and max_requests < 0:
         raise ValueError("max_requests must be non-negative")
     if max_artifact_bytes is not None and max_artifact_bytes < 1024:
         raise ValueError("max_artifact_bytes must be at least 1024")
+    if max_file_bytes is not None and max_file_bytes < _MIN_EXCERPT_BYTES:
+        raise ValueError("max_file_bytes must be at least 256")
     available = set(tracked)
     supplied = set(already_supplied)
     served: list[dict[str, Any]] = []
@@ -69,6 +74,10 @@ def collect_requested_sources(
         if request in seen or path in supplied:
             continue
         seen.add(request)
+        excerpted = False
+        file_limit = max_total_bytes - total
+        if max_file_bytes is not None:
+            file_limit = min(file_limit, max_file_bytes)
         try:
             if pinned_commit is not None:
                 raw, reason = _read_pinned_blob(
@@ -77,6 +86,7 @@ def collect_requested_sources(
                     commit=pinned_commit,
                     git_executable=git_executable,
                     remaining=max_total_bytes - total,
+                    max_file_bytes=max_file_bytes,
                 )
                 if reason is not None:
                     refused.append({"path": request, "reason": reason})
@@ -90,13 +100,22 @@ def collect_requested_sources(
                         {"path": request, "reason": "PATH_OUTSIDE_REPOSITORY"}
                     )
                     continue
-                if candidate.stat().st_size + total > max_total_bytes:
+                size = candidate.stat().st_size
+                if size > file_limit and (
+                    max_file_bytes is None
+                    or size > _MAX_EXCERPT_SOURCE_BYTES
+                    or file_limit < _MIN_EXCERPT_BYTES
+                ):
                     refused.append(
                         {"path": request, "reason": "TOTAL_BUDGET_EXHAUSTED"}
                     )
                     continue
                 raw = candidate.read_bytes()
-            if len(raw) + total > max_total_bytes:
+            if max_file_bytes is not None and len(raw) > file_limit:
+                excerpt = _leading_excerpt(raw, file_limit)
+                excerpted = len(excerpt) < len(raw)
+                raw = excerpt
+            if not raw or len(raw) + total > max_total_bytes:
                 refused.append({"path": request, "reason": "TOTAL_BUDGET_EXHAUSTED"})
                 continue
             text = raw.decode("utf-8")
@@ -113,9 +132,10 @@ def collect_requested_sources(
             text = "\n".join(
                 f"{line}|{lines[line - 1]}" for line in range(start, end + 1)
             )
-        served.append(
-            {"path": request, "content": redact_code(text, workspace=workspace)}
-        )
+        item = {"path": request, "content": redact_code(text, workspace=workspace)}
+        if excerpted:
+            item["excerpt"] = True
+        served.append(item)
         served_sizes.append(len(raw))
         total += len(raw)
     result: dict[str, Any] = {
@@ -148,6 +168,21 @@ def _projected_size(value: object) -> int:
         return len(redact_untrusted_text(raw).data)
 
 
+def _leading_excerpt(raw: bytes, limit: int) -> bytes:
+    cut = raw[:limit]
+    newline = cut.rfind(b"\n")
+    if newline >= limit // 2:
+        cut = cut[: newline + 1]
+    while cut:
+        try:
+            cut.decode("utf-8")
+        except UnicodeError:
+            cut = cut[:-1]
+        else:
+            return cut
+    return b""
+
+
 def _read_pinned_blob(
     workspace: Path,
     path: str,
@@ -155,6 +190,7 @@ def _read_pinned_blob(
     commit: str,
     git_executable: str,
     remaining: int,
+    max_file_bytes: int | None = None,
 ) -> tuple[bytes | None, str | None]:
     def git(*args: str) -> subprocess.CompletedProcess[bytes]:
         return subprocess.run(
@@ -183,7 +219,15 @@ def _read_pinned_blob(
         size = git("cat-file", "-s", oid)
         if size.returncode != 0:
             return None, "PINNED_SOURCE_UNAVAILABLE"
-        if int(size.stdout.strip()) > remaining:
+        blob_size = int(size.stdout.strip())
+        file_limit = remaining
+        if max_file_bytes is not None:
+            file_limit = min(file_limit, max_file_bytes)
+        if blob_size > file_limit and (
+            max_file_bytes is None
+            or blob_size > _MAX_EXCERPT_SOURCE_BYTES
+            or file_limit < _MIN_EXCERPT_BYTES
+        ):
             return None, "TOTAL_BUDGET_EXHAUSTED"
         content = git("cat-file", "blob", oid)
         if content.returncode != 0:

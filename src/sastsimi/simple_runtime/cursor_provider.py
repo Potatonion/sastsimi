@@ -16,9 +16,11 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
 from time import monotonic
-from typing import Any, Protocol
+from typing import Any, Protocol, TextIO
 from uuid import uuid4
 
 from sastsimi.contracts.canonical_json import canonical_bytes
@@ -36,6 +38,50 @@ from .usage_values import canonical_cost, cost_minor_units, token_count
 
 _LOG = logging.getLogger(__name__)
 _MAX_RAW_BYTES = 512 * 1024
+_POC_REFUSAL_HEAD = re.compile(
+    r"^\s*(?:(?:i(?:'m|\s+am)\s+sorry)[,.]?\s+)?(?:"
+    r"i\s+(?:can(?:not|['’]t)|won['’]t|will\s+not)\s+"
+    r"(?:help\b|assist\b|provide\b|write\b|produce\b)|"
+    r"(?:죄송(?:하지만|합니다)?[,.]?\s*)?"
+    r"(?:(?:해당\s+)?(?:요청|내용|코드)(?:을|를)?\s+)?"
+    r"(?:도와드릴|제공할|작성할|생성할|쓸)\s*수\s*없|"
+    r"못\s*(?:쓰겠|작성하겠|제공하겠|도와드리겠)"
+    r")",
+    re.IGNORECASE,
+)
+_POC_REFUSAL_SUBJECT = re.compile(
+    r"\b(?:poc|proof[\s.-]*of[\s.-]*concept|exploit|script)\b|"
+    r"개념\s*증명|재현\s*(?:코드|스크립트)|공격\s*(?:코드|스크립트)|스크립트",
+    re.IGNORECASE,
+)
+_POC_TECHNICAL_INABILITY = re.compile(
+    r"\b(?:invalid|malformed|schema|json|parse|missing|insufficient|"
+    r"dependency|prerequisite|source\s+context|evidence|cannot\s+verify|"
+    r"failed\s+test|does\s+not\s+reproduce)\b|"
+    r"형식|스키마|파싱|누락|부족|의존성|선행\s*조건|소스|증거|검증할\s*수\s*없|"
+    r"재현되지\s*않",
+    re.IGNORECASE,
+)
+_POC_POLICY_REFUSAL = re.compile(
+    r"\b(?:safety|policy|harmful|malicious|unauthori[sz]ed|cybersecurity|"
+    r"cross-user|credential|attack|abuse)\b|"
+    r"안전|정책|악용|공격|무단|권한\s*침해|위험|사이버",
+    re.IGNORECASE,
+)
+
+
+def _explicit_poc_refusal(raw: str) -> bool:
+    """Recognize a direct policy refusal, not quality or parse commentary."""
+
+    text = raw.strip()[:4_096]
+    if not _POC_REFUSAL_HEAD.match(text) or not _POC_REFUSAL_SUBJECT.search(text):
+        return False
+    if _POC_TECHNICAL_INABILITY.search(text) and not _POC_POLICY_REFUSAL.search(text):
+        return False
+    # A short, direct refusal often omits the policy explanation. Longer
+    # responses need an explicit safety signal so quality feedback is not
+    # mislabeled as a provider refusal.
+    return len(text) <= 512 or bool(_POC_POLICY_REFUSAL.search(text))
 
 
 class CursorTransport(Protocol):
@@ -123,15 +169,42 @@ class OfficialCursorCLITransport:
     """Official headless CLI using its own browser-login session, never a key."""
 
     _MODEL_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}) - .+$")
+    _MAX_PROMPT_ARG_BYTES = 96 * 1024
+    _MAX_STREAM_LINE_BYTES = 2 * 1024 * 1024
+    _MAX_STREAM_EVENTS = 2_000
+    _TRACE_PROGRESS_INTERVAL = 250
+    _MAX_STDERR_BYTES = 64 * 1024
 
-    def __init__(self, executable: str) -> None:
+    def __init__(
+        self,
+        executable: str,
+        *,
+        seed_prompt_sources: bool = False,
+        stream_json: bool = False,
+        trace_dir: Path | None = None,
+        trace_label: str = "cursor",
+    ) -> None:
         self._executable = executable
         self._script = os.path.join(os.path.dirname(executable), "index.js")
+        self._seed_prompt_sources = seed_prompt_sources
+        self._stream_json = stream_json
+        self._trace_dir = trace_dir
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,80}", trace_label) is None:
+            raise ValueError("CURSOR_TRACE_LABEL_INVALID")
+        self._trace_label = trace_label
         if not os.path.isfile(self._executable) or not os.path.isfile(self._script):
             raise ValueError("CURSOR_CLI_NOT_INSTALLED")
 
-    async def _run(self, *args: str, timeout: float) -> str:
+    async def _run(
+        self,
+        *args: str,
+        timeout: float,
+        prompt_sources: str | None = None,
+        trace_prompt: str | None = None,
+    ) -> str:
         with tempfile.TemporaryDirectory(prefix="sastsimi-cursor-") as workspace:
+            if prompt_sources is not None:
+                self._stage_prompt_sources(Path(workspace), prompt_sources)
             flags = (
                 int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 if os.name == "nt"
@@ -165,21 +238,68 @@ class OfficialCursorCLITransport:
                 for name, value in os.environ.items()
                 if name.upper() in allowed_env
             }
-            process = await asyncio.create_subprocess_exec(
-                self._executable,
-                self._script,
-                *args,
-                cwd=workspace,
-                env=child_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=flags,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=timeout
+            trace: TextIO | None = None
+            if (
+                self._stream_json
+                and trace_prompt is not None
+                and self._trace_dir is not None
+            ):
+                self._trace_dir.mkdir(parents=True, exist_ok=True)
+                trace_path = (
+                    self._trace_dir
+                    / f"cursor-poc-{self._trace_label}-{uuid4().hex}.jsonl"
                 )
-            except (TimeoutError, asyncio.CancelledError):
+                trace = trace_path.open("x", encoding="utf-8")
+                if os.name != "nt":
+                    trace_path.chmod(0o600)
+                self._trace_event(
+                    trace,
+                    "started",
+                    phase=(
+                        "plan"
+                        if trace_prompt.startswith(
+                            "You are planning a local, harmless PoC"
+                        )
+                        else "candidate"
+                    ),
+                    prompt_bytes=len(trace_prompt.encode("utf-8")),
+                    prompt_sha256=hashlib.sha256(
+                        trace_prompt.encode("utf-8")
+                    ).hexdigest(),
+                    timeout_seconds=timeout,
+                )
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    self._executable,
+                    self._script,
+                    *args,
+                    cwd=workspace,
+                    env=child_env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=flags,
+                    limit=self._MAX_STREAM_LINE_BYTES if self._stream_json else 2**16,
+                )
+            except BaseException:
+                if trace is not None:
+                    trace.close()
+                raise
+            try:
+                if self._stream_json and trace_prompt is not None:
+                    stdout, stderr = await asyncio.wait_for(
+                        self._collect_stream_json(process, trace), timeout=timeout
+                    )
+                else:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(), timeout=timeout
+                    )
+            except BaseException as error:
+                if trace is not None:
+                    self._trace_event(
+                        trace,
+                        "timed_out" if isinstance(error, TimeoutError) else "aborted",
+                        error_type=type(error).__name__,
+                    )
                 if os.name == "nt" and process.pid is not None:
                     try:
                         terminator = await asyncio.create_subprocess_exec(
@@ -196,44 +316,168 @@ class OfficialCursorCLITransport:
                     except Exception:
                         pass
                 if process.returncode is None:
-                    process.kill()
-                await asyncio.wait_for(process.wait(), timeout=5)
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(process.wait(), timeout=5)
                 raise
+            finally:
+                if trace is not None:
+                    trace.close()
             if process.returncode != 0:
-                detail = (stderr + stdout).decode("utf-8", errors="replace").lower()
-                if (
-                    "rate limit" in detail
-                    or "too many requests" in detail
-                    or "429" in detail
-                ):
-                    raise CursorCLIRateLimitError()
-                if "login" in detail or "authenticat" in detail:
-                    raise CursorCLIAuthenticationError()
-                if "model" in detail and (
-                    "invalid" in detail or "unavailable" in detail
-                ):
-                    raise CursorCLIModelError()
-                if (
-                    "upgrade" in detail
-                    or "usage limit" in detail
-                    or "plan limit" in detail
-                ):
-                    raise CursorCLIPlanLimitError()
-                if any(
-                    marker in detail
-                    for marker in (
-                        "internal server error",
-                        "service unavailable",
-                        "502",
-                        "503",
-                        "504",
-                        "network error",
-                        "connection failed",
-                    )
-                ):
-                    raise CursorCLITemporaryError()
+                self._raise_cli_error(stderr + stdout)
+            if self._stream_json and trace_prompt is not None and not stdout:
                 raise CursorCLIExecutionError()
             return stdout.decode("utf-8", errors="strict")
+
+    @classmethod
+    async def _collect_stream_json(
+        cls, process: asyncio.subprocess.Process, trace: TextIO | None
+    ) -> tuple[bytes, bytes]:
+        assert process.stdout is not None and process.stderr is not None
+        stderr_task = asyncio.create_task(cls._drain_stderr(process.stderr))
+        terminal: dict[str, Any] | None = None
+        event_count = 0
+        stream_bytes = 0
+        try:
+            async for line in process.stdout:
+                stream_bytes += len(line)
+                if len(line) > cls._MAX_STREAM_LINE_BYTES:
+                    raise CursorCLIExecutionError()
+                try:
+                    event = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise CursorCLIExecutionError() from error
+                if not isinstance(event, dict):
+                    raise CursorCLIExecutionError()
+                event_count += 1
+                kind = event.get("type")
+                subtype = event.get("subtype")
+                safe_kind = (
+                    kind
+                    if isinstance(kind, str)
+                    and kind in {"system", "user", "assistant", "tool_call", "result"}
+                    else "other"
+                )
+                safe_kind_hash = (
+                    hashlib.sha256(kind.encode("utf-8")).hexdigest()[:12]
+                    if safe_kind == "other" and isinstance(kind, str)
+                    else None
+                )
+                if trace is not None and event_count <= cls._MAX_STREAM_EVENTS:
+                    safe_subtype = (
+                        subtype
+                        if subtype
+                        in {"init", "started", "completed", "success", "error"}
+                        else None
+                    )
+                    cls._trace_event(
+                        trace,
+                        "event",
+                        index=event_count,
+                        type=safe_kind,
+                        type_hash=safe_kind_hash,
+                        subtype=safe_subtype,
+                    )
+                elif trace is not None and event_count == cls._MAX_STREAM_EVENTS + 1:
+                    cls._trace_event(trace, "event_limit_reached")
+                elif (
+                    trace is not None
+                    and event_count > cls._MAX_STREAM_EVENTS
+                    and event_count % cls._TRACE_PROGRESS_INTERVAL == 0
+                ):
+                    cls._trace_event(
+                        trace,
+                        "event_progress",
+                        event_count=event_count,
+                        stream_bytes=stream_bytes,
+                        last_type=safe_kind,
+                        last_type_hash=safe_kind_hash,
+                    )
+                if event.get("type") == "result":
+                    if terminal is not None:
+                        raise CursorCLIExecutionError()
+                    terminal = event
+            await process.wait()
+            stderr = await stderr_task
+            if trace is not None:
+                stderr_text = stderr.decode("utf-8", errors="replace").lower()
+                stderr_class = (
+                    "OPENAI_CYBER_SAFETY_BLOCK"
+                    if "high-risk cybersecurity" in stderr_text
+                    or "flagged this request" in stderr_text
+                    else None
+                )
+                cls._trace_event(
+                    trace,
+                    "exited",
+                    returncode=process.returncode,
+                    event_count=event_count,
+                    stream_bytes=stream_bytes,
+                    result_seen=terminal is not None,
+                    stderr_bytes=len(stderr),
+                    stderr_class=stderr_class,
+                )
+            return (
+                json.dumps(terminal, ensure_ascii=False).encode("utf-8")
+                if terminal is not None
+                else b"",
+                stderr,
+            )
+        finally:
+            if not stderr_task.done():
+                stderr_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stderr_task
+
+    @classmethod
+    async def _drain_stderr(cls, stream: asyncio.StreamReader) -> bytes:
+        captured = bytearray()
+        while chunk := await stream.read(8192):
+            remaining = cls._MAX_STDERR_BYTES - len(captured)
+            if remaining > 0:
+                captured.extend(chunk[:remaining])
+        return bytes(captured)
+
+    @staticmethod
+    def _trace_event(trace: TextIO, event: str, **fields: Any) -> None:
+        trace.write(
+            json.dumps(
+                {"at": datetime.now(UTC).isoformat(), "event": event, **fields},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        trace.flush()
+
+    @staticmethod
+    def _raise_cli_error(output: bytes) -> None:
+        detail = output.decode("utf-8", errors="replace").lower()
+        if "rate limit" in detail or "too many requests" in detail or "429" in detail:
+            raise CursorCLIRateLimitError()
+        if "login" in detail or "authenticat" in detail:
+            raise CursorCLIAuthenticationError()
+        if "model" in detail and ("invalid" in detail or "unavailable" in detail):
+            raise CursorCLIModelError()
+        if "upgrade" in detail or "usage limit" in detail or "plan limit" in detail:
+            raise CursorCLIPlanLimitError()
+        if any(
+            marker in detail
+            for marker in (
+                "internal server error",
+                "service unavailable",
+                "502",
+                "503",
+                "504",
+                "network error",
+                "connection failed",
+            )
+        ):
+            raise CursorCLITemporaryError()
+        if "high-risk cybersecurity" in detail or "flagged this request" in detail:
+            raise CursorCLISafetyBlockError()
+        raise CursorCLIExecutionError()
 
     async def list_models(self, api_key: str) -> set[str]:
         del api_key
@@ -251,17 +495,23 @@ class OfficialCursorCLITransport:
         self, *, api_key: str, model: str, prompt: str, timeout: float
     ) -> tuple[str, dict[str, int | float | None]]:
         del api_key
+        prompt_args = self._prompt_args(prompt)
+        sandbox_args = ("--sandbox", "enabled") if self._seed_prompt_sources else ()
         output = await self._run(
             "--print",
             "--trust",
             "--mode",
             "ask",
+            *sandbox_args,
             "--output-format",
-            "json",
+            "stream-json" if self._stream_json else "json",
             "--model",
             model,
-            prompt,
+            "--",
+            *prompt_args,
             timeout=timeout,
+            prompt_sources=prompt if self._seed_prompt_sources else None,
+            trace_prompt=prompt if self._stream_json else None,
         )
         try:
             envelope = json.loads(output)
@@ -276,6 +526,108 @@ class OfficialCursorCLITransport:
         ):
             raise CursorCLIExecutionError()
         return envelope["result"], {}
+
+    @staticmethod
+    def _stage_prompt_sources(workspace: Path, prompt: str) -> None:
+        """Expose only snippets already sent in this request, never the checkout."""
+
+        marker = "<UNTRUSTED_EXACT_INPUTS>\n"
+        end_marker = "\n</UNTRUSTED_EXACT_INPUTS>"
+        if marker not in prompt:
+            return
+        section = prompt.split(marker, 1)[1].split(end_marker, 1)[0]
+        try:
+            exact_inputs = json.loads(section)["exact_inputs"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ValueError("CURSOR_PROMPT_SOURCES_INVALID") from error
+        if not isinstance(exact_inputs, list):
+            raise ValueError("CURSOR_PROMPT_SOURCES_INVALID")
+        count = 0
+        total_bytes = 0
+        for item in exact_inputs:
+            data = item.get("data") if isinstance(item, dict) else None
+            if (
+                not isinstance(data, dict)
+                or data.get("kind") != "simple_requested_sources"
+            ):
+                continue
+            served = data.get("served")
+            if not isinstance(served, list):
+                raise ValueError("CURSOR_PROMPT_SOURCES_INVALID")
+            for source in served:
+                if not isinstance(source, dict):
+                    raise ValueError("CURSOR_PROMPT_SOURCES_INVALID")
+                raw_path, content = source.get("path"), source.get("content")
+                if isinstance(content, dict):
+                    chunks = content.get("text_chunks")
+                    if (
+                        content.get("join_without_separator") is not True
+                        or not isinstance(chunks, list)
+                        or not all(isinstance(chunk, str) for chunk in chunks)
+                    ):
+                        raise ValueError("CURSOR_PROMPT_SOURCES_INVALID")
+                    content = "".join(chunks)
+                if not isinstance(raw_path, str) or not isinstance(content, str):
+                    raise ValueError("CURSOR_PROMPT_SOURCES_INVALID")
+                path = PurePosixPath(raw_path)
+                if (
+                    path.is_absolute()
+                    or not path.parts
+                    or any(part in {".", ".."} for part in path.parts)
+                    or any(part.startswith(".") for part in path.parts)
+                    or "\\" in raw_path
+                    or ":" in raw_path
+                ):
+                    raise ValueError("CURSOR_PROMPT_SOURCE_PATH_INVALID")
+                encoded = content.encode("utf-8")
+                count += 1
+                total_bytes += len(encoded)
+                if count > 64 or total_bytes > 256 * 1024:
+                    raise ValueError("CURSOR_PROMPT_SOURCES_TOO_LARGE")
+                target = workspace.joinpath(*path.parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists() and target.read_bytes() != encoded:
+                    raise ValueError("CURSOR_PROMPT_SOURCE_CONFLICT")
+                target.write_bytes(encoded)
+
+    @classmethod
+    def _prompt_args(cls, prompt: str) -> tuple[str, ...]:
+        """Use Cursor's variadic prompt arguments below Linux's per-arg limit."""
+        if len(prompt.encode("utf-8")) <= cls._MAX_PROMPT_ARG_BYTES:
+            return (prompt,)
+        if os.name == "nt":
+            raise CursorCLIPromptTooLargeError()
+        parts: list[str] = []
+        start = 0
+        last_boundary = 0
+        current_bytes = 0
+        in_string = False
+        escaped = False
+        for index, char in enumerate(prompt):
+            current_bytes += len(char.encode("utf-8"))
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char in {",", "\n", " "}:
+                last_boundary = index + 1
+            if current_bytes > cls._MAX_PROMPT_ARG_BYTES:
+                if last_boundary <= start:
+                    raise CursorCLIPromptTooLargeError()
+                parts.append(prompt[start:last_boundary])
+                start = last_boundary
+                current_bytes = len(prompt[start : index + 1].encode("utf-8"))
+                last_boundary = 0
+        if start < len(prompt):
+            parts.append(prompt[start:])
+        if any(len(part.encode("utf-8")) > cls._MAX_PROMPT_ARG_BYTES for part in parts):
+            raise CursorCLIPromptTooLargeError()
+        return tuple(parts)
 
 
 class CursorCLIAuthenticationError(Exception):
@@ -295,6 +647,14 @@ class CursorCLIModelCatalogError(Exception):
 
 
 class CursorCLIExecutionError(Exception):
+    is_retryable = True
+
+
+class CursorCLISafetyBlockError(Exception):
+    """Provider refused this prompt, so the same model call will not succeed."""
+
+
+class CursorCLIPromptTooLargeError(Exception):
     pass
 
 
@@ -314,12 +674,58 @@ class CursorModelCatalog:
         self.lock = asyncio.Lock()
 
 
+def _ends_inside_string(prompt: str) -> bool:
+    """Use the same quote rules as CLI prompt splitting."""
+
+    in_string = False
+    escaped = False
+    for char in prompt:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+    return in_string
+
+
+def _invalid_output_correction(detail: str, base_prompt: str) -> str:
+    """Ask for corrected JSON without appending the schema a second time.
+
+    The first prompt already contains the schema. Repeating it can extend an
+    open quoted span past Linux's per-argument limit. A prior closing quote,
+    when the splitter still considers the prompt inside a string, lets the
+    following newline become a real split point.
+    """
+
+    closer = '"' if _ends_inside_string(base_prompt) else ""
+    return (
+        closer + "\nYour previous response failed JSON/schema validation at "
+        + detail
+        + ". Return a corrected JSON object matching the same schema "
+        + "already given above.\n"
+    )
+
+
 def _unwrap_json(raw: str) -> str:
     stripped = raw.strip()
     if stripped.startswith("```") and stripped.endswith("```"):
         first_line, separator, body = stripped.partition("\n")
         if separator and first_line.lower() in {"```", "```json"}:
             return body[:-3].strip()
+    if not stripped.startswith("{"):
+        start = stripped.find("{")
+        if start > 0:
+            try:
+                value, end = json.JSONDecoder().raw_decode(stripped[start:])
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(value, dict) and not stripped[start + end :].strip():
+                    return stripped[start : start + end]
     return stripped
 
 
@@ -340,12 +746,16 @@ def _error_code(error: BaseException) -> tuple[str, bool]:
         return "CURSOR_CONFIGURATION_FAILED", False
     if name == "CursorCLIPlanLimitError":
         return "CURSOR_PLAN_LIMIT", False
+    if name == "CursorCLIPromptTooLargeError":
+        return "CURSOR_PROMPT_TOO_LARGE", False
     if name in {"RateLimitError", "CursorCLIRateLimitError"}:
         return "CURSOR_RATE_LIMITED", True
     if name in {"APITimeoutError", "TimeoutError"}:
         return "CURSOR_TIMED_OUT", True
     if name in {"NetworkError", "InternalServerError", "CursorCLITemporaryError"}:
         return "CURSOR_TEMPORARY_FAILURE", True
+    if name == "CursorCLISafetyBlockError":
+        return "CURSOR_MODEL_SAFETY_BLOCK", False
     return "CURSOR_REQUEST_FAILED", bool(getattr(error, "is_retryable", False))
 
 
@@ -370,6 +780,7 @@ class CursorProvider:
         allow_on_demand: bool,
         fallback: SimpleLLMClient | None = None,
         transport: CursorTransport | None = None,
+        poc_transport: CursorTransport | None = None,
         use_cli_login: bool = False,
         model_catalog: CursorModelCatalog | None = None,
         budget_check: Callable[[], StageFailure | None] | None = None,
@@ -384,6 +795,7 @@ class CursorProvider:
         self._fallback = fallback
         self._use_cli_login = use_cli_login
         self._transport = transport or OfficialCursorTransport(str(artifacts.data_dir))
+        self._poc_transport = poc_transport
         self._attempt_store = SimpleCheckpointStore(artifacts.paths.database)
         self._catalog = model_catalog or CursorModelCatalog()
         self._budget_check = budget_check
@@ -476,8 +888,18 @@ class CursorProvider:
         prompt_digest = hashlib.sha256(prompt).hexdigest()
         last_failure: StageFailure | None = None
         correction = ""
+        switched_late = False
         async with self._semaphore:
-            for attempt in range(1, self._max_retries + 2):
+            # The configured call timeout includes retries and backoff. Giving
+            # every retry a fresh full timeout can multiply a 10-minute wait.
+            deadline = monotonic() + timeout
+            for attempt in range(1, self._max_retries + 3):
+                if attempt > self._max_retries + 1 and not switched_late:
+                    break
+                switched_late = False
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
                 if self._budget_check is not None:
                     budget_failure = self._budget_check()
                     if budget_failure is not None:
@@ -489,24 +911,72 @@ class CursorProvider:
                 parsed_ref = None
                 usage: dict[str, int | float | None] = {}
                 code = "SUCCEEDED"
+                self._attempt_store.start_llm_call(
+                    invocation_id=invocation_id,
+                    analysis_id=self._artifacts.identity.analysis_id,
+                    agent=agent_name,
+                    model=model,
+                    attempt_number=attempt,
+                    started_at=started_at,
+                )
                 try:
+                    transport = (
+                        self._poc_transport
+                        if agent_name == "poc_candidate"
+                        and self._poc_transport is not None
+                        else self._transport
+                    )
                     raw, usage = await asyncio.wait_for(
-                        self._transport.complete(
+                        transport.complete(
                             api_key=key,
                             model=model,
                             prompt=base_prompt + correction,
-                            timeout=timeout,
+                            timeout=remaining,
                         ),
-                        timeout=timeout,
+                        timeout=remaining,
                     )
                     raw = raw[:_MAX_RAW_BYTES]
                     raw_ref = self._artifacts.put_json(
                         {"kind": "cursor_raw_output", "text": raw}
                     )
-                    value = json.loads(_unwrap_json(raw))
-                    if not isinstance(value, dict):
-                        raise ValueError("$: expected object")
-                    _validate_schema(value, output_schema)
+                    try:
+                        value = json.loads(_unwrap_json(raw))
+                        if not isinstance(value, dict):
+                            raise ValueError("$: expected object")
+                        _validate_schema(value, output_schema)
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        if not (
+                            agent_name == "poc_candidate"
+                            and _explicit_poc_refusal(raw)
+                        ):
+                            raise
+                        code = "CURSOR_REFUSED"
+                        last_failure = StageFailure(
+                            code=code,
+                            retryable=False,
+                            safe_message="Model declined PoC generation",
+                            evidence_refs=(raw_ref,),
+                        )
+                        self._record_attempt(
+                            agent_name,
+                            model,
+                            attempt,
+                            started,
+                            code,
+                            raw_ref,
+                            parsed_ref,
+                            usage,
+                        )
+                        refusal_switch = (
+                            model != self._default_model
+                            and self._default_model in models
+                        )
+                        if refusal_switch:
+                            model = self._default_model
+                            if attempt > self._max_retries:
+                                switched_late = True
+                            continue
+                        break
                     canonical = canonical_bytes(value)
                     parsed_ref = self._artifacts.put_bytes(
                         canonical, "application/json"
@@ -544,12 +1014,7 @@ class CursorProvider:
                 except (json.JSONDecodeError, ValueError, TypeError) as error:
                     code = "CURSOR_INVALID_OUTPUT"
                     detail = str(error).splitlines()[0][:200]
-                    correction = (
-                        "\nYour previous response failed JSON/schema validation at "
-                        + detail
-                        + ". Return a corrected JSON object matching the same schema:\n"
-                        + schema_text
-                    )
+                    correction = _invalid_output_correction(detail, base_prompt)
                     last_failure = StageFailure(
                         code=code,
                         retryable=False,
@@ -557,11 +1022,35 @@ class CursorProvider:
                     )
                 except Exception as error:
                     code, retryable = _error_code(error)
+                    safety_switch = (
+                        isinstance(error, CursorCLISafetyBlockError)
+                        and model != self._default_model
+                        and self._default_model in models
+                    )
                     last_failure = StageFailure(
                         code=code,
                         retryable=retryable,
-                        safe_message="Cursor request did not complete",
+                        safe_message=(
+                            "PoC model refused; retrying on the default model"
+                            if safety_switch
+                            else "Cursor request did not complete"
+                        ),
                     )
+                    if safety_switch:
+                        self._record_attempt(
+                            agent_name,
+                            model,
+                            attempt,
+                            started,
+                            code,
+                            raw_ref,
+                            parsed_ref,
+                            usage,
+                        )
+                        model = self._default_model
+                        if attempt > self._max_retries:
+                            switched_late = True
+                        continue
                     if not retryable:
                         self._record_attempt(
                             agent_name,
@@ -574,6 +1063,11 @@ class CursorProvider:
                             usage,
                         )
                         break
+                finally:
+                    self._attempt_store.finish_llm_call(
+                        invocation_id=invocation_id,
+                        analysis_id=self._artifacts.identity.analysis_id,
+                    )
                 self._record_attempt(
                     agent_name,
                     model,
@@ -585,15 +1079,23 @@ class CursorProvider:
                     usage,
                 )
                 if attempt <= self._max_retries:
-                    await asyncio.sleep(
+                    delay = (
                         min(8.0, 0.5 * 2 ** (attempt - 1)) + random.uniform(0, 0.25)
                     )
+                    if deadline - monotonic() <= delay:
+                        break
+                    await asyncio.sleep(delay)
         assert last_failure is not None
-        if self._fallback is not None and last_failure.retryable:
+        remaining_ms = int(max(0, deadline - monotonic()) * 1000)
+        if (
+            self._fallback is not None
+            and last_failure.retryable
+            and remaining_ms > 0
+        ):
             return await self._fallback.call(
                 prompt=prompt,
                 output_schema=output_schema,
-                timeout_ms=timeout_ms,
+                timeout_ms=remaining_ms,
                 agent_name=agent_name,
             )
         return last_failure

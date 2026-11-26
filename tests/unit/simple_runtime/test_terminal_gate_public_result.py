@@ -21,6 +21,7 @@ from sastsimi.contracts.refs import StoredDataRef
 from sastsimi.dashboard.query import DashboardQuery
 from sastsimi.interfaces.cli.main import main
 from sastsimi.reporting.analysis_display_id import AnalysisDisplayIdStore
+from sastsimi.simple_runtime.benchmark import StaticGroundTruthComparison
 from sastsimi.simple_runtime.models import (
     HYPOTHESIS_STAGES,
     STAGE_VERSION,
@@ -149,6 +150,14 @@ def test_public_result_and_dashboard_agree_on_inconclusive_gate(
 
     dashboard = DashboardQuery(data_dir).get_analysis("A-001")
     result = application.result("A-001")
+    benchmark_result = application.benchmark_result(
+        "A-001",
+        static_comparison=StaticGroundTruthComparison(
+            true_positive_ids=("GT-1",),
+            false_positive_ids=(),
+            false_negative_ids=("GT-2",),
+        ),
+    )
 
     assert dashboard.status == result["status"] == "COMPLETE"
     assert dashboard.progress_percent == result["percent"] == 100
@@ -156,6 +165,40 @@ def test_public_result_and_dashboard_agree_on_inconclusive_gate(
     assert result["inconclusive_hypothesis_count"] == 1
     assert result["rejected_hypothesis_count"] == 0
     assert result["findings"] == []
+    assert result["static_detection_ref"] is None
+    assert result["benchmark_metrics"]["static_detection"] == {
+        "status": "GROUND_TRUTH_NOT_ATTACHED",
+        "detected_count": 1,
+        "ground_truth_count": None,
+        "true_positive": None,
+        "false_positive": None,
+        "false_negative": None,
+        "precision": None,
+        "recall": None,
+        "f1": None,
+    }
+    assert result["benchmark_metrics"]["poc_generation"] == {
+        "attempted_hypotheses": 1,
+        "succeeded_hypotheses": 1,
+        "refused_hypotheses": 0,
+        "success_rate": 1.0,
+    }
+    assert result["benchmark_metrics"]["dynamic_validation"] == {
+        "attempted_hypotheses": 1,
+        "succeeded_hypotheses": 0,
+        "success_rate": 0.0,
+    }
+    assert benchmark_result["benchmark_metrics"]["static_detection"] == {
+        "status": "MEASURED",
+        "detected_count": 1,
+        "ground_truth_count": 2,
+        "true_positive": 1,
+        "false_positive": 0,
+        "false_negative": 1,
+        "precision": 1.0,
+        "recall": 0.5,
+        "f1": 0.666667,
+    }
     assert (
         main(
             ["result", "A-001", "--format", "json"],
@@ -167,6 +210,7 @@ def test_public_result_and_dashboard_agree_on_inconclusive_gate(
     payload = json.loads(capsys.readouterr().out)
     assert payload["data"]["status"] == "COMPLETE"
     assert payload["data"]["inconclusive_hypothesis_count"] == 1
+    assert payload["data"]["benchmark_metrics"] == result["benchmark_metrics"]
 
 
 def test_dashboard_shows_completed_inconclusive_poc_without_finding(

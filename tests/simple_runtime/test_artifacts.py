@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from sastsimi.simple_runtime.artifacts import SimpleArtifactRepository
+from sastsimi.simple_runtime.cursor_provider import OfficialCursorCLITransport
 from sastsimi.simple_runtime.models import CheckpointIdentity
 
 
@@ -55,6 +56,22 @@ def test_strict_context_keeps_policy_exact_and_redacts_complete_optional_inputs(
     assert b"tech-secret" not in context
     assert b"poc-secret" not in context
     assert b"verify-secret" not in context
+
+
+def test_large_prompt_context_chunks_text_without_dropping_content(
+    tmp_path: Path,
+) -> None:
+    artifacts = _repository(tmp_path)
+    original = "fact-" * 35_000
+    ref = artifacts.put_json({"facts": original})
+
+    context = artifacts.prompt_context((ref,)).decode("utf-8")
+    parts = OfficialCursorCLITransport._prompt_args(context)
+    data = json.loads(" ".join(parts))["exact_inputs"][0]["data"]["facts"]
+
+    assert len(parts) > 1
+    assert data["join_without_separator"] is True
+    assert "".join(data["text_chunks"]) == original
 
 
 def test_strict_context_budgets_redacted_optional_data(tmp_path: Path) -> None:

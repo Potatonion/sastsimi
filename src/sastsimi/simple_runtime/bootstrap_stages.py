@@ -40,6 +40,7 @@ from .application import (
 )
 from .artifacts import SimpleArtifactRepository
 from .github_policy import DiscoveredPolicy
+from .hypothesis_context import project_hypothesis_facts
 from .models import CheckpointIdentity, StageFailure
 from .opengrep_rule_batches import (
     RuleBatch,
@@ -2555,6 +2556,21 @@ class DirectStaticBootstrap:
             or (status.stdout and not status.stdout.endswith(b"\0"))
         ):
             raise RuntimeError("GIT_STATUS_FAILED")
+        crash_logs = self._archive_untracked_jvm_crash_logs(
+            workspace, request.data_dir, status.stdout
+        )
+        if crash_logs:
+            status = await self._process.run(
+                (git, "status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                cwd=workspace,
+                timeout_seconds=60,
+            )
+            if (
+                status.returncode != 0
+                or status.stdout_truncated
+                or (status.stdout and not status.stdout.endswith(b"\0"))
+            ):
+                raise RuntimeError("GIT_STATUS_FAILED")
         if any(
             entry != b"?? .sastsimi-ready.json"
             for entry in status.stdout.split(b"\0")
@@ -2583,6 +2599,30 @@ class DirectStaticBootstrap:
             leaf = entry.replace(b"\\", b"/").rsplit(b"/", 1)[-1].lower()
             if leaf in {b".semgrepignore", b".gitignore"}:
                 raise RuntimeError("WORKSPACE_DIRTY")
+
+    @staticmethod
+    def _archive_untracked_jvm_crash_logs(
+        workspace: Path, data_dir: Path, status: bytes
+    ) -> bool:
+        """Keep CodeQL/JVM diagnostics without making the pinned checkout dirty."""
+        names = []
+        for entry in status.split(b"\0"):
+            if not entry.startswith(b"?? "):
+                continue
+            name = entry[3:]
+            if re.fullmatch(rb"(?:hs_err|replay)_pid[0-9]+\.log", name):
+                names.append(os.fsdecode(name))
+        if not names:
+            return False
+        archive = data_dir / "process-output" / "jvm-crashes" / workspace.name
+        archive.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            source = workspace / name
+            if source.is_symlink() or not source.is_file():
+                raise RuntimeError("WORKSPACE_DIRTY")
+            destination = archive / f"{uuid4().hex}-{name}"
+            source.rename(destination)
+        return True
 
     async def _codeql_with_reuse(
         self,
@@ -3146,15 +3186,21 @@ class DirectStaticBootstrap:
             raise RuntimeError(f"REQUIRED_TOOL_MISSING:{name}") from None
 
 
+# Not a target count. The prompt asks for every distinct issue. This only
+# stops a degenerate list after identical proposals have been removed.
+_HYPOTHESIS_RUNAWAY_LIMIT = 64
+
+
 class DirectHypothesisBootstrap:
     def __init__(
         self,
         *,
         data_dir: Path,
         client_factory: SimpleClientFactory,
-        max_hypotheses: int = 12,
+        max_hypotheses: int = _HYPOTHESIS_RUNAWAY_LIMIT,
         feed: str = "current",
         store: SimpleCheckpointStore | None = None,
+        timeout_seconds: int = 180,
     ) -> None:
         self._data_dir = data_dir
         self._client_factory = client_factory
@@ -3163,6 +3209,9 @@ class DirectHypothesisBootstrap:
             raise ValueError("HYPOTHESIS_FEED_INVALID")
         self._feed = feed
         self._store = store
+        if timeout_seconds <= 0:
+            raise ValueError("HYPOTHESIS_TIMEOUT_INVALID")
+        self._timeout_ms = timeout_seconds * 1000
 
     async def propose(
         self,
@@ -3179,6 +3228,7 @@ class DirectHypothesisBootstrap:
                 store=self._store,
                 client=client,
                 max_hypotheses=self._max_hypotheses,
+                timeout_ms=self._timeout_ms,
             ).run(identity, static)
         schema = {
             "type": "object",
@@ -3215,21 +3265,34 @@ class DirectHypothesisBootstrap:
             "required": ["hypotheses"],
             "additionalProperties": False,
         }
-        context = artifacts.prompt_context((static.static_bundle_ref,))
+        try:
+            bundle = json.loads(artifacts.read(static.static_bundle_ref))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return StageFailure(
+                code="HYPOTHESIS_STATIC_BUNDLE_INVALID",
+                retryable=False,
+                safe_message="Static facts for hypothesis generation are unreadable",
+            )
+        projection_ref = artifacts.put_json(project_hypothesis_facts(bundle))
+        context = artifacts.prompt_context((projection_ref,))
         prompt = (
             b"You are the Hypothesis Agent. Use only the supplied static facts and "
-            b"code snippets. Return concrete web-security hypotheses with exact code "
+            b"code snippets. The facts are a bounded projection: tool findings come "
+            b"before AST calls, snippets may be shortened, and omitted_* counts are "
+            b"facts that did not fit. Cover the distinct files and rules that are "
+            b"present. Return concrete web-security hypotheses with exact code "
             b"locations. Static tool hits are facts, not vulnerability verdicts. "
-            b"Do not invent missing code. Return at most "
-            + str(self._max_hypotheses).encode()
-            + b" hypotheses.\n<UNTRUSTED_EXACT_INPUTS>\n"
+            b"Do not invent missing code. Return one hypothesis for each distinct "
+            b"issue the facts make plausible, including when the evidence does not "
+            b"fully close the issue. Do not repeat an issue or add filler.\n"
+            b"<UNTRUSTED_EXACT_INPUTS>\n"
             + context
             + b"\n</UNTRUSTED_EXACT_INPUTS>\n"
         )
         result = await client.call(
             prompt=prompt,
             output_schema=schema,
-            timeout_ms=180_000,
+            timeout_ms=self._timeout_ms,
             agent_name="hypothesis",
         )
         if isinstance(result, StageFailure):
@@ -3240,10 +3303,17 @@ class DirectHypothesisBootstrap:
             raise RuntimeError("HYPOTHESIS_OUTPUT_INVALID")
         seeds: list[HypothesisSeed] = []
         seen: set[str] = set()
-        for index, value in enumerate(raw[: self._max_hypotheses]):
+        seen_proposals: set[str] = set()
+        for index, value in enumerate(raw):
             if not isinstance(value, dict):
                 continue
             canonical = canonical_bytes(value)
+            proposal_digest = hashlib.sha256(canonical).hexdigest()
+            if proposal_digest in seen_proposals:
+                continue
+            if len(seeds) >= self._max_hypotheses:
+                break
+            seen_proposals.add(proposal_digest)
             hypothesis_id = (
                 "hypothesis-"
                 + hashlib.sha256(

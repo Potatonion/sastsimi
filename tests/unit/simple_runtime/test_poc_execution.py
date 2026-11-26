@@ -226,6 +226,74 @@ async def test_executed_inconclusive_poc_is_terminal_only_at_attempt_limit(
 
 
 @pytest.mark.asyncio
+async def test_clean_exit_one_observation_is_stored_instead_of_retried(
+    tmp_path: Path,
+) -> None:
+    identity = CheckpointIdentity(
+        analysis_id="analysis-disproved",
+        workspace_id="workspace-disproved",
+        commit_id="a" * 40,
+        hypothesis_id="hypothesis-disproved",
+    )
+    artifacts = SimpleArtifactRepository(tmp_path, identity)
+    content_ref = artifacts.put_bytes(
+        b"#!/bin/sh\nprintf observed\n", "text/x-shellscript"
+    )
+    candidate_ref = artifacts.put_json({"kind": "simple_poc_candidate"})
+    refs = (candidate_ref, content_ref)
+    candidate = StageCheckpoint(
+        identity=identity,
+        stage=SimpleStage.POC_CANDIDATE_DONE,
+        status=StageStatus.SUCCEEDED,
+        input_refs=(),
+        input_hash=input_reference_hash(()),
+        output_refs=refs,
+        attempt_id="attempt-disproved",
+        image_digest=f"sha256:{'1' * 64}",
+    )
+    current = StageCheckpoint(
+        identity=identity,
+        stage=SimpleStage.POC_EXECUTION_DONE,
+        status=StageStatus.PENDING,
+        input_refs=refs,
+        input_hash=input_reference_hash(refs),
+        attempt_id="attempt-disproved",
+        attempt_number=3,
+    )
+
+    class _ObservedExit(_Docker):
+        async def execute(self, *_args: Any, **_kwargs: Any) -> DockerCommandOutcome:
+            return DockerCommandOutcome(
+                1,
+                b"absent_key_rejected=yes\nhypothesis=disproved\n",
+                b"",
+                False,
+            )
+
+    class _RecordingInconclusive(_InconclusiveClient):
+        def __init__(self) -> None:
+            self.prompt = b""
+
+        async def call(self, **kwargs: Any) -> SimpleLLMCallResult:
+            self.prompt = kwargs["prompt"]
+            return await super().call(**kwargs)
+
+    client = _RecordingInconclusive()
+    stage = PoCExecutionStage(
+        client=client,
+        artifacts=artifacts,
+        docker=_ObservedExit(),  # type: ignore[arg-type]
+        containers=_Containers(),
+    )
+
+    result = await stage(current, {SimpleStage.POC_CANDIDATE_DONE: candidate})
+
+    assert result.verdict == "HOLD"
+    assert result.validated_poc_ref is None
+    assert b"Exit 1 with recorded observations" in client.prompt
+
+
+@pytest.mark.asyncio
 async def test_poc_execution_error_is_blocked_and_releases_container(
     tmp_path: Path,
 ) -> None:
@@ -280,6 +348,76 @@ async def test_poc_execution_error_is_blocked_and_releases_container(
         await stage(current, {SimpleStage.POC_CANDIDATE_DONE: candidate})
 
     assert blocked.value.failure.code == "POC_EXECUTION_FAILED"
+    assert containers.released == ["a" * 64]
+
+
+@pytest.mark.asyncio
+async def test_missing_dependency_in_degraded_image_is_explicit_and_not_retried(
+    tmp_path: Path,
+) -> None:
+    identity = CheckpointIdentity(
+        analysis_id="analysis-degraded",
+        workspace_id="workspace-degraded",
+        commit_id="a" * 40,
+        hypothesis_id="hypothesis-degraded",
+    )
+    artifacts = SimpleArtifactRepository(tmp_path, identity)
+    content_ref = artifacts.put_bytes(
+        b"#!/bin/sh\npython -c 'import django'\n", "text/x-shellscript"
+    )
+    candidate_ref = artifacts.put_json({"kind": "simple_poc_candidate"})
+    recipe_ref = artifacts.put_json(
+        {
+            "kind": "simple_environment_recipe",
+            "dockerfile_source": "GENERATED_NO_INSTALL",
+            "degraded": True,
+        }
+    )
+    refs = (candidate_ref, content_ref)
+    candidate = StageCheckpoint(
+        identity=identity,
+        stage=SimpleStage.POC_CANDIDATE_DONE,
+        status=StageStatus.SUCCEEDED,
+        input_refs=(),
+        input_hash=input_reference_hash(()),
+        output_refs=refs,
+        attempt_id="attempt-degraded",
+        image_digest=f"sha256:{'1' * 64}",
+        recipe_ref=recipe_ref,
+    )
+    current = StageCheckpoint(
+        identity=identity,
+        stage=SimpleStage.POC_EXECUTION_DONE,
+        status=StageStatus.PENDING,
+        input_refs=refs,
+        input_hash=input_reference_hash(refs),
+        attempt_id="attempt-degraded",
+    )
+
+    class _MissingDjangoDocker(_Docker):
+        async def execute(self, *_args: Any, **_kwargs: Any) -> DockerCommandOutcome:
+            return DockerCommandOutcome(
+                2,
+                b"",
+                b"Traceback (most recent call last):\n"
+                b"ModuleNotFoundError: No module named 'django'\n",
+                False,
+            )
+
+    containers = _Containers()
+    stage = PoCExecutionStage(
+        client=_DisprovingClient(),
+        artifacts=artifacts,
+        docker=_MissingDjangoDocker(),  # type: ignore[arg-type]
+        containers=containers,
+    )
+
+    with pytest.raises(StageBlocked) as blocked:
+        await stage(current, {SimpleStage.POC_CANDIDATE_DONE: candidate})
+
+    assert blocked.value.failure.code == "POC_ENVIRONMENT_DEPENDENCIES_MISSING"
+    assert blocked.value.failure.retryable is False
+    assert recipe_ref in blocked.value.failure.evidence_refs
     assert containers.released == ["a" * 64]
 
 

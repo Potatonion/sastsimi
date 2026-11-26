@@ -38,6 +38,7 @@ class _SurveyClient:
         self.fail_second = fail_second
         self.openings = 0
         self.batches: list[tuple[str, ...]] = []
+        self.timeouts: list[int] = []
 
     async def call(
         self,
@@ -47,7 +48,8 @@ class _SurveyClient:
         timeout_ms: int,
         agent_name: str = "agent",
     ) -> SimpleLLMCallResult | StageFailure:
-        del output_schema, timeout_ms
+        del output_schema
+        self.timeouts.append(timeout_ms)
         if agent_name == "hypothesis_survey":
             self.openings += 1
             return _answer(
@@ -134,6 +136,49 @@ async def test_survey_batches_eight_then_one_and_deduplicates(tmp_path: Path) ->
     )
     assert len(progress) == 10
     assert "__survey__" in progress
+
+
+@pytest.mark.asyncio
+async def test_hypothesis_bootstrap_uses_configured_timeout_for_both_feeds(
+    tmp_path: Path,
+) -> None:
+    identity, static, store = _setup(tmp_path)
+
+    class CurrentClient:
+        timeout_ms: int | None = None
+
+        async def call(
+            self,
+            *,
+            prompt: bytes,
+            output_schema: Mapping[str, Any],
+            timeout_ms: int,
+            agent_name: str = "agent",
+        ) -> StageFailure:
+            del prompt, output_schema
+            assert agent_name == "hypothesis"
+            self.timeout_ms = timeout_ms
+            return StageFailure(
+                code="TEST_STOP", retryable=False, safe_message="test only"
+            )
+
+    current = CurrentClient()
+    await DirectHypothesisBootstrap(
+        data_dir=tmp_path / "data",
+        client_factory=lambda *_: current,
+        timeout_seconds=600,
+    ).propose(identity, static)
+    assert current.timeout_ms == 600_000
+
+    survey = _SurveyClient()
+    await DirectHypothesisBootstrap(
+        data_dir=tmp_path / "data",
+        client_factory=lambda *_: survey,
+        feed="facts_survey",
+        store=store,
+        timeout_seconds=600,
+    ).propose(identity, static)
+    assert survey.timeouts and set(survey.timeouts) == {600_000}
 
 
 @pytest.mark.asyncio

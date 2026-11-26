@@ -32,7 +32,29 @@ from .recovery import (
 )
 from .stages import ReproductionEnvironment
 
+# Source files stay immutable for uid 10001. Sticky directories still accept
+# new runtime paths the application creates beside the checkout, such as a
+# storage directory allocated while settings are imported.
+_WORKSPACE_LAYOUT = (
+    "RUN chmod -R a+rX /workspace"
+    " && find /workspace -type d -exec chmod 1777 {} +"
+    " && find /workspace -type f -exec chmod a-w {} +"
+    " && mkdir -p /tmp && chmod 1777 /tmp\n"
+)
 _RESOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _same_container(listed_id: str, inspected_id: str) -> bool:
+    """Docker ps may return a short id while inspect returns the full id."""
+
+    if listed_id == inspected_id:
+        return True
+    short, full = (
+        (listed_id, inspected_id)
+        if len(listed_id) <= len(inspected_id)
+        else (inspected_id, listed_id)
+    )
+    return len(short) >= 12 and full.startswith(short)
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _MAX_OUTPUT = 1024 * 1024
 _DEPENDENCY_INSTALL = re.compile(
@@ -62,7 +84,8 @@ class PortableDockerRuntime:
             self._executable = profile.tools["docker"].executable_path
         except KeyError:
             raise ValueError("DOCKER_NOT_CONFIGURED") from None
-        self._network = "default" if profile.docker_network == "BRIDGE" else "none"
+        build_network = profile.docker_build_network or profile.docker_network
+        self._network = "default" if build_network == "BRIDGE" else "none"
         configured_timeout = profile.max_elapsed_seconds
         self._timeout = max(
             30, 3600 if configured_timeout == "unlimited" else configured_timeout
@@ -110,6 +133,8 @@ class PortableDockerRuntime:
         )
         if inspected.exit_code == 0:
             return self._image_digest(inspected.stdout)
+        if self._daemon_unavailable(inspected):
+            raise DockerOperationError("DOCKER_DAEMON_UNAVAILABLE", inspected)
         args: list[str] = [
             "build",
             "--pull=false",
@@ -188,10 +213,15 @@ class PortableDockerRuntime:
             "2g",
             "--tmpfs",
             "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
+            # Repository images may define an entrypoint that exits or starts
+            # the application. The isolated PoC container needs a stable PID 1
+            # until the script has been copied in and executed explicitly.
+            "--entrypoint",
+            "/bin/sh",
         ]
         for key, value in sorted(labels.items()):
             args.extend(("--label", f"{key}={value}"))
-        args.extend((image_digest, "sleep", "infinity"))
+        args.extend((image_digest, "-c", "exec sleep infinity"))
         created = await self._run(tuple(args), timeout_seconds=60)
         self._require_success("DOCKER_CREATE_FAILED", created)
         container_id = created.stdout.decode("ascii", errors="strict").strip()
@@ -199,6 +229,22 @@ class PortableDockerRuntime:
         try:
             await self._require_success_call(
                 "DOCKER_START_FAILED", ("start", container_id)
+            )
+            # Images built before this layout still have a root-owned checkout.
+            # Apply it as root at start so a reused image can create new runtime
+            # directories without making existing source files writable.
+            await self._require_success_call(
+                "DOCKER_WORKSPACE_LAYOUT_FAILED",
+                (
+                    "exec",
+                    "--user",
+                    "0:0",
+                    container_id,
+                    "sh",
+                    "-c",
+                    "find /workspace -type d -exec chmod 1777 {} + "
+                    "&& find /workspace -type f -exec chmod a-w {} +",
+                ),
             )
         except (DockerOperationError, asyncio.CancelledError):
             if labels.get("sastsimi.owner") == "simple-runtime":
@@ -310,7 +356,7 @@ class PortableDockerRuntime:
         self, container_id: str, expected: Mapping[str, str]
     ) -> bool:
         state = await self.inspect(container_id)
-        if state.container_id != container_id or any(
+        if not _same_container(state.container_id, container_id) or any(
             state.labels.get(key) != value for key, value in expected.items()
         ):
             return False
@@ -324,6 +370,7 @@ class PortableDockerRuntime:
                 "ps",
                 "--all",
                 "--quiet",
+                "--no-trunc",
                 "--filter",
                 "label=sastsimi.owner=simple-runtime",
             ),
@@ -343,7 +390,7 @@ class PortableDockerRuntime:
                 continue
             labels = state.labels
             if (
-                state.container_id != container_id
+                not _same_container(state.container_id, container_id)
                 or labels.get("sastsimi.owner") != "simple-runtime"
                 or labels.get("sastsimi.host") != socket.gethostname()
             ):
@@ -363,10 +410,23 @@ class PortableDockerRuntime:
                 attempt_id = labels["sastsimi.attempt-id"]
             except (KeyError, TypeError, ValueError):
                 continue
-            if pid > 0 and self._pid_known_dead(pid):
+            if pid > 0 and self._owner_process_gone(pid):
                 if await self.remove_owned(container_id, identity, attempt_id):
                     removed.append(container_id)
         return tuple(removed)
+
+    def _owner_process_gone(self, pid: int) -> bool:
+        """A recorded owner is gone when the pid exited or was reused."""
+
+        if self._pid_known_dead(pid):
+            return True
+        if os.name != "posix" or pid <= 0:
+            return False
+        try:
+            command = open(f"/proc/{pid}/cmdline", "rb").read()
+        except OSError:
+            return False
+        return b"sastsimi" not in command
 
     @staticmethod
     def _pid_known_dead(pid: int, *, platform_name: str | None = None) -> bool:
@@ -499,7 +559,17 @@ class PortableDockerRuntime:
     @staticmethod
     def _require_success(code: str, outcome: DockerCommandOutcome) -> None:
         if outcome.timed_out or outcome.exit_code != 0:
+            if PortableDockerRuntime._daemon_unavailable(outcome):
+                raise DockerOperationError("DOCKER_DAEMON_UNAVAILABLE", outcome)
             raise DockerOperationError(code, outcome)
+
+    @staticmethod
+    def _daemon_unavailable(outcome: DockerCommandOutcome) -> bool:
+        return (
+            not outcome.timed_out
+            and outcome.exit_code != 0
+            and b"Cannot connect to the Docker daemon" in outcome.stderr
+        )
 
     @staticmethod
     def _require_resource_id(value: str) -> None:
@@ -584,8 +654,7 @@ class DirectEnvironmentPreparer:
                 b"\nUSER root\nWORKDIR /workspace\nCOPY . /workspace\n"
                 + git_install
                 + target_install
-                + b"RUN chmod -R a+rX /workspace && mkdir -p /tmp "
-                b"&& chmod 1777 /tmp\n"
+                + _WORKSPACE_LAYOUT.encode()
             )
             source = "REPOSITORY_DOCKERFILE"
         else:
@@ -617,7 +686,11 @@ class DirectEnvironmentPreparer:
                 if (
                     not degraded
                     and not target_install
-                    and target_manifest in {None, "requirements.txt", "pyproject.toml"}
+                    # A source-only fallback is useful only when there is no
+                    # declared project dependency set to install. Otherwise a
+                    # successful image build falsely suggests the PoC can run.
+                    and target_manifest is None
+                    and not (self._workspace / "requirements.txt").is_file()
                     and self._dependency_install_failed(error, dockerfile)
                 ):
                     dockerfile = self._generated_dockerfile(include_dependencies=False)
@@ -1123,7 +1196,7 @@ class DirectEnvironmentPreparer:
             f"{install}\n"
             f"{git_install}"
             f"{target_install.decode('utf-8')}"
-            "RUN chmod -R a+rX /workspace && mkdir -p /tmp && chmod 1777 /tmp\n"
+            f"{_WORKSPACE_LAYOUT}"
             'CMD ["sleep", "infinity"]\n'
         ).encode()
 

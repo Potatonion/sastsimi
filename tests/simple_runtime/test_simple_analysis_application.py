@@ -1875,6 +1875,50 @@ async def test_hypothesis_provider_failure_preserves_retryability(
 
 
 @pytest.mark.asyncio
+async def test_missing_recovery_provider_keeps_original_blocked_error(
+    tmp_path: Path,
+) -> None:
+    class FailedHypotheses:
+        async def propose(
+            self, _identity: CheckpointIdentity, _static: StaticBootstrapResult
+        ) -> StageFailure:
+            return StageFailure(
+                code="CURSOR_CLI_NOT_INSTALLED",
+                retryable=True,
+                safe_message="Cursor CLI is unavailable",
+            )
+
+    def missing_provider(_identity: CheckpointIdentity) -> _RecoveryFactory:
+        raise ValueError("CURSOR_CLI_NOT_INSTALLED")
+
+    store = SimpleCheckpointStore(tmp_path / "db" / "sastsimi.sqlite3")
+    application = SimpleAnalysisApplication(
+        data_dir=tmp_path,
+        store=store,
+        static_bootstrap=_Static(),
+        hypothesis_bootstrap=FailedHypotheses(),
+        runner_factory=_runner,
+        recovery_factory=missing_provider,
+        id_factory=iter(("analysis-1", "workspace-1")).__next__,
+    )
+
+    outcome = await application.analyze(
+        SimpleAnalysisRequest(
+            data_dir=tmp_path,
+            repository="https://example.invalid/repo.git",
+            commit="a" * 40,
+        )
+    )
+
+    assert outcome.status == "BLOCKED"
+    assert outcome.error_code == "CURSOR_CLI_NOT_INSTALLED"
+    checkpoint = store.require(outcome.identity, SimpleStage.HYPOTHESIS_DONE)
+    assert checkpoint.status is StageStatus.BLOCKED
+    assert checkpoint.attempt_number == 1
+    assert (await application.resume(outcome.identity.analysis_id)).status == "BLOCKED"
+
+
+@pytest.mark.asyncio
 async def test_resume_reuses_static_and_hypothesis_results(tmp_path: Path) -> None:
     store = SimpleCheckpointStore(tmp_path / "db" / "sastsimi.sqlite3")
     static = _Static()

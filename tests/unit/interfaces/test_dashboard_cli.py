@@ -35,4 +35,13 @@ def test_dashboard_cli_rejects_external_host(tmp_path) -> None:
     )
 
 
+def test_dashboard_cli_reports_missing_database(tmp_path, capsys) -> None:
+    assert main(["--data-dir", str(tmp_path), "dashboard"]) != 0
+    output = capsys.readouterr()
+    assert "DASHBOARD_DATABASE_NOT_FOUND" in output.err
+    assert "XDG_CONFIG_HOME" in output.err
+    assert str(tmp_path) in output.out
+    assert not (tmp_path / "db" / "sastsimi.sqlite3").exists()
+
+
 # mypy: disable-error-code="no-untyped-def,var-annotated"

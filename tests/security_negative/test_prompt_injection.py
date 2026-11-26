@@ -152,3 +152,15 @@ def test_poc_candidate_allows_sandbox_paths_but_not_host_or_secret_values() -> N
     assert rejected_secret.categories == ("TOKEN",)
     assert b"sk-secretvalue" not in rejected_secret.data
     assert b"[REDACTED:TOKEN]" in rejected_secret.data
+
+
+def test_poc_candidate_restores_double_digit_sandbox_path_markers() -> None:
+    content = "#!/bin/sh\n" + "\n".join(
+        f"test -f /tmp/poc-fixture-{index}" for index in range(12)
+    )
+    candidate = canonical_bytes({"content": content})
+
+    inspected = inspect_poc_candidate_json(candidate)
+
+    assert inspected.categories == ()
+    assert inspected.data == candidate

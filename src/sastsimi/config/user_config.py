@@ -309,6 +309,9 @@ class SimpleExecutionProfile(BaseModel):
     max_elapsed_seconds: ElapsedLimit = "unlimited"
     static_scan_pass_seconds: int = Field(default=180, gt=0)
     docker_network: Literal["NONE", "BRIDGE"]
+    # Optional override for image builds. Existing profiles keep their
+    # docker_network behavior; PoC containers themselves always use none.
+    docker_build_network: Literal["NONE", "BRIDGE"] | None = None
     tools: dict[str, SimpleToolBinding]
     agent_models: dict[str, str] = Field(default_factory=dict)
     llm_timeout_seconds: int = Field(default=180, gt=0, le=3600)
@@ -377,6 +380,11 @@ class SimpleExecutionProfile(BaseModel):
             f"max_tokens = {_limit_toml(self.max_tokens)}",
             f"max_elapsed_seconds = {_limit_toml(self.max_elapsed_seconds)}",
             f"docker_network = {_quoted(self.docker_network)}",
+            *(
+                [f"docker_build_network = {_quoted(self.docker_build_network)}"]
+                if self.docker_build_network is not None
+                else []
+            ),
             f"llm_timeout_seconds = {self.llm_timeout_seconds}",
             f"llm_max_retries = {self.llm_max_retries}",
             f"llm_max_concurrency = {self.llm_max_concurrency}",

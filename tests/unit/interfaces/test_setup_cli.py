@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -701,6 +702,32 @@ def test_cursor_cli_member_login_is_default_for_cursor_setup(tmp_path: Path) -> 
     assert saved.auth_mode == "SUBSCRIPTION_LOGIN"
     assert saved.credential_ref == "CURSOR_CLI_LOGIN"
     assert "cursor_agent" in result.profile_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux Cursor installer layout")
+def test_cursor_discovery_accepts_versioned_linux_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    version = "2026.10.01-example"
+    install = tmp_path / "cursor-agent" / "versions" / version
+    install.mkdir(parents=True)
+    launcher = install / "cursor-agent"
+    launcher.write_text(f"#!/bin/sh\nprintf '%s\n' '{version}'\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    native = install / "node"
+    native.write_bytes(b"native node")
+    (install / "index.js").write_text("", encoding="utf-8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "agent").symlink_to(launcher)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+
+    inspection = SystemToolDiscovery._inspect_cursor_agent()
+
+    assert inspection.available
+    assert inspection.executable == native.resolve()
+    assert inspection.version == version
+    assert inspection.executable_sha256 is not None
 
 
 def test_cursor_factory_rediscovers_cli_after_installer_update(

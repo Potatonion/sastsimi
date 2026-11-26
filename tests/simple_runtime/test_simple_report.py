@@ -32,7 +32,7 @@ from sastsimi.simple_runtime.models import (
     input_reference_hash,
 )
 from sastsimi.simple_runtime.provider import SimpleLLMCallResult
-from sastsimi.simple_runtime.runner import SimpleRuntimeRunner
+from sastsimi.simple_runtime.runner import SimpleRuntimeRunner, StageBlocked
 from sastsimi.simple_runtime.scope_policy import validate_scope_decision
 from sastsimi.simple_runtime.stages import ReporterStage
 from sastsimi.simple_runtime.store import SimpleCheckpointStore
@@ -888,6 +888,137 @@ def test_public_report_and_export_restrict_legacy_unverified_allow(
     assert exported.endswith("F-001.restricted.md")
     assert (data_dir / exported).read_text(encoding="utf-8") == shown
     assert report_path.read_text(encoding="utf-8") == old_text
+
+
+def _draft_value(summary: str) -> dict[str, Any]:
+    prose = {
+        "title": "Confirmed issue",
+        "summary": summary,
+        "details": "The tested flow reaches the sink.",
+        "impact": "The isolated run reproduced the behavior.",
+        "recommendation": "Constrain the input.",
+        "limitations": ["Only an isolated environment was tested."],
+        "review_items": ["Review the deployed configuration."],
+    }
+    return {
+        "schema_version": 2,
+        "en": prose,
+        "ko": {
+            "title": "검증된 문제",
+            "summary": "검증된 경로가 싱크에 도달합니다.",
+            "details": "시험한 흐름이 싱크까지 전달됩니다.",
+            "impact": "격리된 실행에서 동작이 재현되었습니다.",
+            "recommendation": "입력을 제한하세요.",
+            "limitations": ["로컬 격리 환경에서만 재현했습니다."],
+            "review_items": ["배포 설정을 확인해야 합니다."],
+        },
+        "citations": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_reporter_retries_a_draft_that_states_a_version(tmp_path: Path) -> None:
+    identity = CheckpointIdentity(
+        analysis_id="analysis-1",
+        workspace_id="workspace-1",
+        commit_id="commit-1",
+        hypothesis_id="hypothesis-1",
+    )
+    artifacts = SimpleArtifactRepository(tmp_path, identity)
+    finding_ref = artifacts.put_json({"kind": "simple_finding"})
+    stage = ReporterStage(_ReporterClient(), artifacts)
+    prompts: list[bytes] = []
+
+    async def fake_call(
+        _checkpoint: StageCheckpoint,
+        _refs: tuple[Any, ...],
+        *,
+        correction: str = "",
+    ) -> tuple[SimpleLLMCallResult, Any]:
+        prompts.append(correction.encode("utf-8"))
+        summary = (
+            "The tested flow reaches the sink."
+            if correction
+            else "Affects version 1.2.3."
+        )
+        value = _draft_value(summary)
+        result = SimpleLLMCallResult(
+            value=value,
+            prompt_digest="a" * 64,
+            output_digest="b" * 64,
+        )
+        draft_ref = artifacts.put_json(
+            {"kind": "simple_report_draft", "result": value}
+        )
+        return result, draft_ref
+
+    stage._stage.call = fake_call  # type: ignore[method-assign]
+    current = _checkpoint(identity, SimpleStage.REPORT_DONE, attempt_id="report")
+    prior = {
+        SimpleStage.FINDING_DONE: _checkpoint(
+            identity, SimpleStage.FINDING_DONE, outputs=(finding_ref,), attempt_id="f"
+        ),
+        SimpleStage.POC_EXECUTION_DONE: _checkpoint(
+            identity, SimpleStage.POC_EXECUTION_DONE, attempt_id="e"
+        ),
+    }
+
+    _result, _ref, content, reused = await stage._draft(current, prior, finding_ref)
+
+    assert reused is False
+    assert content.en.summary == "The tested flow reaches the sink."
+    assert len(prompts) == 2
+    assert b"REPORT_UNSUPPORTED_METADATA_CLAIM" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_reporter_stops_after_repeated_metadata_claims(tmp_path: Path) -> None:
+    identity = CheckpointIdentity(
+        analysis_id="analysis-1",
+        workspace_id="workspace-1",
+        commit_id="commit-1",
+        hypothesis_id="hypothesis-1",
+    )
+    artifacts = SimpleArtifactRepository(tmp_path, identity)
+    finding_ref = artifacts.put_json({"kind": "simple_finding"})
+    stage = ReporterStage(_ReporterClient(), artifacts)
+    calls = 0
+
+    async def fake_call(
+        _checkpoint: StageCheckpoint,
+        _refs: tuple[Any, ...],
+        *,
+        correction: str = "",
+    ) -> tuple[SimpleLLMCallResult, Any]:
+        nonlocal calls
+        calls += 1
+        value = _draft_value("Affects version 1.2.3.")
+        result = SimpleLLMCallResult(
+            value=value,
+            prompt_digest="a" * 64,
+            output_digest="b" * 64,
+        )
+        draft_ref = artifacts.put_json(
+            {"kind": "simple_report_draft", "result": value}
+        )
+        return result, draft_ref
+
+    stage._stage.call = fake_call  # type: ignore[method-assign]
+    current = _checkpoint(identity, SimpleStage.REPORT_DONE, attempt_id="report")
+    prior = {
+        SimpleStage.FINDING_DONE: _checkpoint(
+            identity, SimpleStage.FINDING_DONE, outputs=(finding_ref,), attempt_id="f"
+        ),
+        SimpleStage.POC_EXECUTION_DONE: _checkpoint(
+            identity, SimpleStage.POC_EXECUTION_DONE, attempt_id="e"
+        ),
+    }
+
+    with pytest.raises(StageBlocked) as raised:
+        await stage._draft(current, prior, finding_ref)
+
+    assert raised.value.failure.code == "REPORT_UNSUPPORTED_METADATA_CLAIM"
+    assert calls == 3
 
 
 # mypy: disable-error-code="arg-type,no-untyped-def,unused-ignore"

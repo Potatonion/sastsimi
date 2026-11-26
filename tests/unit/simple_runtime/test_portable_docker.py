@@ -92,6 +92,39 @@ async def test_failed_docker_build_keeps_diagnostic_output() -> None:
     assert b"Git executable not found" in failure.value.outcome.stderr
 
 
+@pytest.mark.asyncio
+async def test_unavailable_docker_daemon_stops_before_build() -> None:
+    class _NoDaemonDocker(_BuildFailurePortableDockerRuntime):
+        async def _run(
+            self,
+            args: Sequence[str],
+            *,
+            timeout_seconds: int,
+            input_bytes: bytes | None = None,
+        ) -> DockerCommandOutcome:
+            del timeout_seconds, input_bytes
+            self.calls.append(tuple(args))
+            return DockerCommandOutcome(
+                exit_code=1,
+                stdout=b"",
+                stderr=b"Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+                timed_out=False,
+            )
+
+    docker = _NoDaemonDocker()
+    with pytest.raises(DockerOperationError) as failure:
+        await docker.build_or_reuse(
+            workspace=Path.cwd(),
+            dockerfile=b"FROM python:3.12-slim\n",
+            cache_key="daemon-unavailable",
+            labels={},
+        )
+
+    assert failure.value.code == "DOCKER_DAEMON_UNAVAILABLE"
+    assert len(docker.calls) == 1
+    assert docker.calls[0][:2] == ("image", "inspect")
+
+
 @pytest.mark.parametrize(
     ("elapsed_limit", "expected_timeout"),
     [(7200, 7200), ("unlimited", 3600)],
@@ -125,6 +158,46 @@ def test_docker_call_timeout_preserves_finite_configuration(
     runtime = PortableDockerRuntime(profile)
 
     assert runtime._timeout == expected_timeout
+
+
+@pytest.mark.asyncio
+async def test_build_network_override_does_not_change_poc_network() -> None:
+    profile = SimpleExecutionProfile(
+        provider_profile_ref="test",
+        provider="test",
+        model="test",
+        auth_mode="API_KEY",
+        credential_ref="env:TEST_API_KEY",
+        data_dir=Path.cwd(),
+        workspace_root=Path.cwd(),
+        max_cost_minor_units=1,
+        max_tokens=1,
+        docker_network="NONE",
+        docker_build_network="BRIDGE",
+        tools={
+            "docker": SimpleToolBinding(
+                executable_path=Path("docker"),
+                version="test",
+                executable_sha256="a" * 64,
+            )
+        },
+    )
+
+    runtime = PortableDockerRuntime(profile)
+
+    assert runtime._network == "default"
+    assert 'docker_build_network = "BRIDGE"' in profile.to_toml()
+    assert (
+        SimpleExecutionProfile.model_validate(
+            profile.model_dump(exclude={"docker_build_network"})
+        ).docker_build_network
+        is None
+    )
+    recording = _RecordingPortableDockerRuntime(profile)
+    recording.calls = []
+    await recording.create_container(f"sha256:{'a' * 64}", {})
+    created = next(call for call in recording.calls if call[0] == "create")
+    assert created[created.index("--network") + 1] == "none"
 
 
 class _BuildDocker:
@@ -201,6 +274,7 @@ async def test_dependency_failure_uses_recorded_source_only_fallback(
     assert recipe["degraded"] is True
     assert len(recipe["build_attempt_refs"]) == 2
     assert b"pip install" not in docker.dockerfiles[1]
+    assert b"find /workspace -type d -exec chmod 1777 {} +" in docker.dockerfiles[1]
     assert json.loads(artifacts.read(result.recipe_ref))["status"] == "BUILT"
 
 
@@ -238,7 +312,9 @@ async def test_unrelated_build_failure_does_not_fallback(
 
 
 @pytest.mark.asyncio
-async def test_both_build_failures_recorded_without_success(tmp_path: Path) -> None:
+async def test_declared_dependencies_do_not_use_no_install_fallback(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "requirements.txt").write_text("broken==1\n", encoding="utf-8")
@@ -250,9 +326,7 @@ async def test_both_build_failures_recorded_without_success(tmp_path: Path) -> N
     )
     artifacts = SimpleArtifactRepository(tmp_path / "data", identity)
     checkpoint = _environment_checkpoint(artifacts, action="RETRY_STAGE", patch="")
-    docker = _FailingBuildDocker(
-        [b"RUN pip install -r requirements.txt: exit code 1", b"network timeout"]
-    )
+    docker = _FailingBuildDocker([b"RUN pip install -r requirements.txt: exit code 1"])
 
     with pytest.raises(DockerOperationError) as failure:
         await DirectEnvironmentPreparer(
@@ -261,8 +335,11 @@ async def test_both_build_failures_recorded_without_success(tmp_path: Path) -> N
             workspace=workspace,
         ).prepare(checkpoint, {}, ())
 
-    assert len(docker.dockerfiles) == 2
-    assert len(failure.value.attempt_refs) == 2  # type: ignore[attr-defined]
+    assert len(docker.dockerfiles) == 1
+    assert len(failure.value.attempt_refs) == 1  # type: ignore[attr-defined]
+    recipe = json.loads(artifacts.read(failure.value.recipe_ref))  # type: ignore[attr-defined]
+    assert recipe["status"] == "BLOCKED"
+    assert recipe["degraded"] is False
 
 
 def _environment_checkpoint(
@@ -414,6 +491,11 @@ async def test_reproduction_container_keeps_baked_workspace_writable() -> None:
     assert "--read-only" not in create
     assert "--network" in create
     assert "no-new-privileges" in create
+    assert create[create.index("--entrypoint") + 1] == "/bin/sh"
+    assert create[-3:] == ("sha256:" + "a" * 64, "-c", "exec sleep infinity")
+    assert runtime.calls[2][:4] == ("exec", "--user", "0:0", "container-1")
+    assert "chmod 1777" in runtime.calls[2][-1]
+    assert "chmod a-w" in runtime.calls[2][-1]
 
 
 @pytest.mark.asyncio
@@ -953,6 +1035,8 @@ async def test_repository_uv_image_can_install_git_before_sync(
     assert b"apt-get install -y --no-install-recommends git" in built
     assert b"apk add --no-cache git" in built
     assert b"SASTSIMI_GIT_UNAVAILABLE" in built
+    assert b"find /workspace -type d -exec chmod 1777 {} +" in built
+    assert b"find /workspace -type f -exec chmod a-w {} +" in built
     assert (workspace / "Dockerfile").read_bytes() == original
     assert json.loads(artifacts.read(result.recipe_ref))["dockerfile_source"] == (
         "REPOSITORY_DOCKERFILE"

@@ -117,6 +117,158 @@ async def test_non_retryable_failure_never_calls_recovery_llm(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_cursor_timeout_stops_automatic_recovery_without_another_llm_call(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _running_checkpoint().model_copy(
+        update={"stage": SimpleStage.POC_CANDIDATE_DONE}
+    )
+    client = DecisionClient({})
+    result = await SimpleRecoveryCoordinator(
+        client=client,
+        artifacts=SimpleArtifactRepository(tmp_path, checkpoint.identity),
+    ).decide(
+        checkpoint,
+        StageFailure(
+            code="CURSOR_TIMED_OUT",
+            retryable=True,
+            safe_message="Cursor request did not complete",
+        ),
+    )
+    assert result.decision.action is RecoveryAction.STOP
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_docker_daemon_unavailable_waits_for_operator_without_llm(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _running_checkpoint().model_copy(
+        update={
+            "stage": SimpleStage.VERIFICATION_INITIAL_DONE,
+            "stage_version": STAGE_VERSION[SimpleStage.VERIFICATION_INITIAL_DONE],
+        }
+    )
+    client = DecisionClient({})
+    result = await SimpleRecoveryCoordinator(
+        client=client,
+        artifacts=SimpleArtifactRepository(tmp_path, checkpoint.identity),
+    ).decide(
+        checkpoint,
+        StageFailure(
+            code="DOCKER_DAEMON_UNAVAILABLE",
+            retryable=True,
+            safe_message="Docker is unavailable",
+        ),
+    )
+
+    assert result.decision.action is RecoveryAction.STOP
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_docker_materialization_failure_does_not_regenerate_poc(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _running_checkpoint().model_copy(
+        update={
+            "stage": SimpleStage.POC_EXECUTION_DONE,
+            "stage_version": STAGE_VERSION[SimpleStage.POC_EXECUTION_DONE],
+        }
+    )
+    client = DecisionClient({})
+    result = await SimpleRecoveryCoordinator(
+        client=client,
+        artifacts=SimpleArtifactRepository(tmp_path, checkpoint.identity),
+    ).decide(
+        checkpoint,
+        StageFailure(
+            code="DOCKER_POC_MATERIALIZATION_FAILED",
+            retryable=True,
+            safe_message="Container is not running",
+        ),
+    )
+
+    assert result.decision.action is RecoveryAction.STOP
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_report_content_failure_retries_without_recovery_llm(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _running_checkpoint().model_copy(
+        update={
+            "stage": SimpleStage.REPORT_DONE,
+            "stage_version": STAGE_VERSION[SimpleStage.REPORT_DONE],
+        }
+    )
+    client = DecisionClient({})
+    result = await SimpleRecoveryCoordinator(
+        client=client,
+        artifacts=SimpleArtifactRepository(tmp_path, checkpoint.identity),
+    ).decide(
+        checkpoint,
+        StageFailure(
+            code="STAGE_UNEXPECTED_ERROR",
+            retryable=True,
+            safe_message="Stage execution ended unexpectedly; retry is allowed",
+        ),
+    )
+    assert result.decision.action is RecoveryAction.RETRY_STAGE
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stage_reopens_without_recovery_llm(tmp_path: Path) -> None:
+    checkpoint = _running_checkpoint().model_copy(
+        update={
+            "stage": SimpleStage.VERIFICATION_INITIAL_DONE,
+            "stage_version": STAGE_VERSION[SimpleStage.VERIFICATION_INITIAL_DONE],
+            "status": StageStatus.BLOCKED,
+        }
+    )
+    client = DecisionClient({})
+    result = await SimpleRecoveryCoordinator(
+        client=client,
+        artifacts=SimpleArtifactRepository(tmp_path, checkpoint.identity),
+    ).decide(
+        checkpoint,
+        StageFailure(
+            code="STAGE_CANCELLED",
+            retryable=True,
+            safe_message="Operator stopped the stage",
+        ),
+    )
+    assert result.decision.action is RecoveryAction.RETRY_STAGE
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_restored_cursor_cli_retries_blocked_hypothesis_without_llm(
+    tmp_path: Path,
+) -> None:
+    checkpoint = _running_checkpoint().model_copy(
+        update={"stage": SimpleStage.HYPOTHESIS_DONE, "status": StageStatus.BLOCKED}
+    )
+    client = DecisionClient({})
+    artifacts = SimpleArtifactRepository(tmp_path, checkpoint.identity)
+
+    result = await SimpleRecoveryCoordinator(client=client, artifacts=artifacts).decide(
+        checkpoint,
+        StageFailure(
+            code="CURSOR_CLI_NOT_INSTALLED",
+            retryable=True,
+            safe_message="Cursor CLI was unavailable",
+        ),
+    )
+
+    assert result.decision.category is RecoveryCategory.TRANSIENT_TOOL
+    assert result.decision.action is RecoveryAction.RETRY_STAGE
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_valid_environment_rebuild_is_stored_as_exact_artifact(
     tmp_path: Path,
 ) -> None:
@@ -568,7 +720,7 @@ async def test_recovery_prompt_redacts_and_bounds_failure_evidence(
     assert client.calls == 1
     assert b"hidden" not in client.prompts[0]
     assert b"[REDACTED:CREDENTIAL]" in client.prompts[0]
-    assert len(client.prompts[0]) < 270 * 1024
+    assert len(client.prompts[0]) <= 96 * 1024
 
 
 @pytest.mark.asyncio

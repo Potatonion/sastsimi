@@ -132,6 +132,44 @@ class _CompletedPublicApplication(_PublicApplication):
         }
 
 
+def test_public_retry_passes_explicit_terminal_targets(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class TargetedApplication(_PublicApplication):
+        def retry(
+            self,
+            analysis_id: str,
+            *,
+            hypothesis_ids: tuple[str, ...] = (),
+            allow_terminal_retry: bool = False,
+        ) -> dict[str, object]:
+            assert analysis_id == "A-010"
+            assert hypothesis_ids == ("hypothesis-one", "hypothesis-two")
+            assert allow_terminal_retry is True
+            return {"analysis_id": analysis_id, "status": "READY_TO_RESUME"}
+
+    code = main(
+        [
+            "retry",
+            "A-010",
+            "--hypothesis-id",
+            "hypothesis-one",
+            "--hypothesis-id",
+            "hypothesis-two",
+            "--allow-terminal-retry",
+            "--format",
+            "json",
+        ],
+        public_application=TargetedApplication(),
+        user_config_store=_config(tmp_path),
+    )
+
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["data"]["status"] == (
+        "READY_TO_RESUME"
+    )
+
+
 def test_public_report_export_includes_additive_bundle_path(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -316,6 +354,56 @@ def test_public_retry_prints_backup_and_resume_command(
     assert "수동 재시도 1회" in output
     assert "db/backups/before-retry.sqlite3" in output
     assert "sastsimi resume A-001" in output
+
+
+def test_public_retry_all_poc_timeouts_dispatches_explicit_bulk_retry(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class BulkApplication(_PublicApplication):
+        def retry(
+            self, analysis_id: str, *, all_poc_timeouts: bool = False
+        ) -> dict[str, object]:
+            assert all_poc_timeouts is True
+            return {
+                **super().retry(analysis_id),
+                "retry_count": 9,
+            }
+
+    assert (
+        main(
+            ["retry", "A-001", "--all-poc-timeouts"],
+            public_application=BulkApplication(),
+            user_config_store=_config(tmp_path),
+        )
+        == 0
+    )
+    assert "수동 재시도 9회" in capsys.readouterr().out
+
+
+def test_public_retry_rebuild_environment_dispatches_explicit_rebuild(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class RebuildApplication(_PublicApplication):
+        def retry(
+            self, analysis_id: str, *, rebuild_environment: bool = False
+        ) -> dict[str, object]:
+            assert rebuild_environment is True
+            return {
+                **super().retry(analysis_id),
+                "current_stage": "VERIFICATION_INITIAL_DONE",
+            }
+
+    assert (
+        main(
+            ["retry", "A-001", "--rebuild-environment"],
+            public_application=RebuildApplication(),
+            user_config_store=_config(tmp_path),
+        )
+        == 0
+    )
+    assert "VERIFICATION_INITIAL_DONE" in capsys.readouterr().out
 
 
 def test_public_retry_explains_completed_analysis_without_internal_error(

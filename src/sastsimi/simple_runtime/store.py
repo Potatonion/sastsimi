@@ -140,12 +140,47 @@ class SimpleCheckpointStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS simple_llm_inflight (
+                    invocation_id TEXT PRIMARY KEY,
+                    analysis_id TEXT NOT NULL,
+                    agent TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL,
+                    started_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS simple_hypothesis_survey_progress (
                     analysis_id TEXT NOT NULL,
                     bundle_hash TEXT NOT NULL,
                     item_key TEXT NOT NULL,
                     ref_json TEXT NOT NULL,
                     PRIMARY KEY (analysis_id, bundle_hash, item_key)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS simple_poc_plan_progress (
+                    analysis_id TEXT NOT NULL,
+                    hypothesis_key TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    ref_json TEXT NOT NULL,
+                    PRIMARY KEY (analysis_id, hypothesis_key, input_hash)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS simple_pro_con_progress (
+                    analysis_id TEXT NOT NULL,
+                    hypothesis_key TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    ref_json TEXT NOT NULL,
+                    PRIMARY KEY (analysis_id, hypothesis_key, input_hash, role)
                 )
                 """
             )
@@ -1008,6 +1043,84 @@ class SimpleCheckpointStore:
             )
         return tuple(attempts)
 
+    def pro_con_ref(
+        self, identity: CheckpointIdentity, input_hash: str, role: str
+    ) -> StoredDataRef | None:
+        if identity.hypothesis_id is None or role not in {"pro", "con"}:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT ref_json FROM simple_pro_con_progress "
+                "WHERE analysis_id = ? AND hypothesis_key = ? "
+                "AND input_hash = ? AND role = ?",
+                (identity.analysis_id, identity.hypothesis_id, input_hash, role),
+            ).fetchone()
+        return StoredDataRef.model_validate_json(row["ref_json"]) if row else None
+
+    def save_pro_con_ref(
+        self,
+        identity: CheckpointIdentity,
+        input_hash: str,
+        role: str,
+        ref: StoredDataRef,
+    ) -> None:
+        if identity.hypothesis_id is None or role not in {"pro", "con"}:
+            raise ValueError("PRO_CON_PROGRESS_INVALID")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT ref_json FROM simple_pro_con_progress "
+                "WHERE analysis_id = ? AND hypothesis_key = ? "
+                "AND input_hash = ? AND role = ?",
+                (identity.analysis_id, identity.hypothesis_id, input_hash, role),
+            ).fetchone()
+            if row is not None:
+                if StoredDataRef.model_validate_json(row["ref_json"]) != ref:
+                    raise ValueError("PRO_CON_PROGRESS_CONFLICT")
+                return
+            connection.execute(
+                "INSERT INTO simple_pro_con_progress "
+                "(analysis_id, hypothesis_key, input_hash, role, ref_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    identity.analysis_id,
+                    identity.hypothesis_id,
+                    input_hash,
+                    role,
+                    ref.model_dump_json(),
+                ),
+            )
+
+    def poc_plan_ref(
+        self, identity: CheckpointIdentity, input_hash: str
+    ) -> StoredDataRef | None:
+        if identity.hypothesis_id is None:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT ref_json FROM simple_poc_plan_progress "
+                "WHERE analysis_id = ? AND hypothesis_key = ? AND input_hash = ?",
+                (identity.analysis_id, identity.hypothesis_id, input_hash),
+            ).fetchone()
+        return StoredDataRef.model_validate_json(row["ref_json"]) if row else None
+
+    def save_poc_plan_ref(
+        self, identity: CheckpointIdentity, input_hash: str, ref: StoredDataRef
+    ) -> None:
+        if identity.hypothesis_id is None:
+            raise ValueError("POC_PLAN_REQUIRES_HYPOTHESIS")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO simple_poc_plan_progress "
+                "(analysis_id, hypothesis_key, input_hash, ref_json) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    identity.analysis_id,
+                    identity.hypothesis_id,
+                    input_hash,
+                    ref.model_dump_json(),
+                ),
+            )
+
     def save_survey_progress(
         self, analysis_id: str, bundle_hash: str, item_key: str, ref: StoredDataRef
     ) -> None:
@@ -1121,6 +1234,43 @@ class SimpleCheckpointStore:
             (run.analysis_id, run.model_dump_json()),
         )
 
+    def start_llm_call(
+        self,
+        *,
+        invocation_id: str,
+        analysis_id: str,
+        agent: str,
+        model: str,
+        attempt_number: int,
+        started_at: datetime,
+    ) -> None:
+        """Expose an active call without storing its prompt or response."""
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO simple_llm_inflight
+                    (invocation_id, analysis_id, agent, model,
+                     attempt_number, started_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    invocation_id,
+                    analysis_id,
+                    agent,
+                    model,
+                    attempt_number,
+                    started_at.isoformat(),
+                ),
+            )
+
+    def finish_llm_call(self, *, invocation_id: str, analysis_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM simple_llm_inflight "
+                "WHERE invocation_id = ? AND analysis_id = ?",
+                (invocation_id, analysis_id),
+            )
+
     def record_llm_attempt(
         self,
         *,
@@ -1200,6 +1350,24 @@ class SimpleCheckpointStore:
     def usage_summary(self, analysis_id: str) -> dict[str, int | float | None]:
         with self._connect() as connection:
             return self.usage_summary_from_connection(connection, analysis_id)
+
+    def llm_attempt_status_counts(
+        self, analysis_id: str, *, agent: str | None = None
+    ) -> dict[str, int]:
+        """Return recorded provider outcomes without collapsing refusal into failure."""
+
+        statement = (
+            "SELECT status, COUNT(*) AS count FROM simple_llm_attempts "
+            "WHERE analysis_id = ?"
+        )
+        parameters: tuple[str, ...] = (analysis_id,)
+        if agent is not None:
+            statement += " AND agent = ?"
+            parameters = (analysis_id, agent)
+        statement += " GROUP BY status ORDER BY status"
+        with self._connect() as connection:
+            rows = connection.execute(statement, parameters).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
 
     def llm_elapsed_ms(self, analysis_id: str) -> int:
         """Return elapsed time of recorded LLM attempts across every resume."""
@@ -1524,7 +1692,9 @@ class SimpleCheckpointStore:
                 self._lifecycle_event(
                     checkpoint,
                     ActivityKind.STAGE_STARTED,
-                    sequence=self._stage_sequence(stage, 1),
+                    sequence=self._stage_sequence(
+                        stage, max(checkpoint.attempt_number, 1)
+                    ),
                     status=StageStatus.RUNNING,
                     summary_ko="단계 실행을 시작했습니다.",
                 ),
@@ -2116,6 +2286,7 @@ class SimpleCheckpointStore:
                 checkpoint.identity.analysis_id,
                 checkpoint.identity.hypothesis_id or "",
                 attempt_id,
+                str(checkpoint.attempt_number),
                 str(sequence),
                 kind.value,
             )
@@ -2213,25 +2384,74 @@ class SimpleCheckpointStore:
         finally:
             connection.close()
 
-    def reopen_for_manual_retry(self, blocked: StageCheckpoint) -> StageCheckpoint:
+    def reopen_for_manual_retry(
+        self,
+        blocked: StageCheckpoint,
+        *,
+        input_refs: tuple[StoredDataRef, ...] | None = None,
+        allow_terminal_retry: bool = False,
+    ) -> StageCheckpoint:
         """Re-arm one explicitly selected blocked stage for an operator retry."""
 
         current = self.get(blocked.identity, blocked.stage)
         if current != blocked:
             raise ValueError("MANUAL_RETRY_CHECKPOINT_STALE")
         exhausted = blocked.error_code == "RECOVERY_EXHAUSTED"
-        if blocked.status is not StageStatus.BLOCKED or not (
-            blocked.retryable or exhausted
+        manually_retryable_failure = (
+            blocked.status is StageStatus.FAILED
+            and blocked.error_code
+            in {
+                "CURSOR_INVALID_OUTPUT",
+                "CURSOR_REQUEST_FAILED",
+                "LLM_ELAPSED_BUDGET_EXHAUSTED",
+            }
+        )
+        source_context_retry = (
+            blocked.status is StageStatus.BLOCKED
+            and blocked.error_code == "POC_SOURCE_CONTEXT_UNAVAILABLE"
+        )
+        terminal_retry = allow_terminal_retry and (
+            blocked.stage is SimpleStage.POC_CANDIDATE_DONE
+            and blocked.status is StageStatus.BLOCKED
+            and blocked.error_code == "POC_MODEL_REFUSED"
+            or blocked.stage is SimpleStage.POC_CANDIDATE_DONE
+            and blocked.status is StageStatus.FAILED
+            and blocked.error_code == "CURSOR_MODEL_SAFETY_BLOCK"
+            or blocked.stage is SimpleStage.REPORT_DONE
+            and blocked.status is StageStatus.FAILED
+            and blocked.error_code == "CURSOR_PROMPT_TOO_LARGE"
+        )
+        if not (
+            blocked.status is StageStatus.BLOCKED
+            and (blocked.retryable or exhausted)
+            or manually_retryable_failure
+            or source_context_retry
+            or terminal_retry
         ):
             raise ValueError("MANUAL_RETRY_REQUIRES_RETRYABLE_BLOCKED_CHECKPOINT")
+        if input_refs is not None and (
+            blocked.stage is not SimpleStage.POC_CANDIDATE_DONE
+            or not input_refs
+            or any(ref not in blocked.input_refs for ref in input_refs)
+        ):
+            raise ValueError("MANUAL_RETRY_INPUT_REFS_INVALID")
         attempt_number = (
             MAX_RECOVERY_ATTEMPTS - 1
-            if exhausted and blocked.attempt_number >= MAX_RECOVERY_ATTEMPTS
+            if (exhausted or manually_retryable_failure or terminal_retry)
+            and blocked.attempt_number >= MAX_RECOVERY_ATTEMPTS
             else blocked.attempt_number
         )
         pending = blocked.model_copy(
             update={
                 "status": StageStatus.PENDING,
+                "input_refs": (
+                    input_refs if input_refs is not None else blocked.input_refs
+                ),
+                "input_hash": (
+                    input_reference_hash(input_refs)
+                    if input_refs is not None
+                    else blocked.input_hash
+                ),
                 "output_refs": (),
                 "attempt_id": None,
                 "attempt_number": attempt_number,
@@ -2245,6 +2465,67 @@ class SimpleCheckpointStore:
                 "markdown_path": None,
                 "updated_at": datetime.now(UTC),
             }
+        )
+        self.replace_from(pending)
+        return pending
+
+    def reopen_poc_for_manual_repair(
+        self,
+        blocked: StageCheckpoint,
+        candidate: StageCheckpoint,
+        *,
+        repair_input_refs: tuple[StoredDataRef, ...],
+    ) -> StageCheckpoint:
+        """Regenerate a failed PoC once, retaining its script and runtime error."""
+
+        if (
+            blocked.stage is not SimpleStage.POC_EXECUTION_DONE
+            or blocked.status is not StageStatus.BLOCKED
+            or not (blocked.retryable or blocked.error_code == "RECOVERY_EXHAUSTED")
+            or candidate.stage is not SimpleStage.POC_CANDIDATE_DONE
+            or candidate.status is not StageStatus.SUCCEEDED
+            or candidate.identity != blocked.identity
+            or self.get(blocked.identity, blocked.stage) != blocked
+            or self.get(candidate.identity, candidate.stage) != candidate
+            or not repair_input_refs
+            or any(
+                ref not in candidate.input_refs
+                and ref not in candidate.output_refs
+                and ref not in blocked.output_refs
+                for ref in repair_input_refs
+            )
+        ):
+            raise ValueError("MANUAL_POC_REPAIR_CHECKPOINT_INVALID")
+        inputs = tuple(dict.fromkeys(repair_input_refs))
+        lineage_id = blocked.recovery_lineage_id or hashlib.sha256(
+            canonical_bytes(
+                {
+                    "identity": blocked.identity,
+                    "stage": blocked.stage.value,
+                    "input_hash": blocked.input_hash,
+                    "manual_repair": True,
+                }
+            )
+        ).hexdigest()
+        pending = StageCheckpoint(
+            identity=blocked.identity,
+            stage=SimpleStage.POC_CANDIDATE_DONE,
+            stage_version=STAGE_VERSION[SimpleStage.POC_CANDIDATE_DONE],
+            status=StageStatus.PENDING,
+            input_refs=inputs,
+            input_hash=input_reference_hash(inputs),
+            attempt_number=(
+                MAX_RECOVERY_ATTEMPTS - 1
+                if blocked.error_code == "RECOVERY_EXHAUSTED"
+                and blocked.attempt_number >= MAX_RECOVERY_ATTEMPTS
+                else blocked.attempt_number
+            ),
+            gate_revision_count=blocked.gate_revision_count,
+            recovery_lineage_id=lineage_id,
+            recovery_origin_stage=blocked.recovery_origin_stage or blocked.stage,
+            recovery_decision_refs=blocked.recovery_decision_refs,
+            recipe_ref=candidate.recipe_ref,
+            image_digest=candidate.image_digest,
         )
         self.replace_from(pending)
         return pending

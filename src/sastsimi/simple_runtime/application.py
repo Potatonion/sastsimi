@@ -29,6 +29,7 @@ from .models import (
     StageResult,
     StageStatus,
     input_reference_hash,
+    terminal_candidate_outcome,
     terminal_gate_outcome,
     terminal_poc_outcome,
 )
@@ -417,7 +418,10 @@ class SimpleAnalysisApplication:
             hypothesis_id: {} for hypothesis_id in run.hypothesis_ids
         }
         for checkpoint in self._store.list_checkpoints(run.analysis_id):
-            if checkpoint.status is not StageStatus.SUCCEEDED:
+            if (
+                checkpoint.status is not StageStatus.SUCCEEDED
+                and terminal_candidate_outcome(checkpoint) is None
+            ):
                 return False
             hypothesis_id = checkpoint.identity.hypothesis_id
             if hypothesis_id not in children:
@@ -430,7 +434,9 @@ class SimpleAnalysisApplication:
             chaining = stages.get(SimpleStage.CHAINING_DONE)
             report = stages.get(SimpleStage.REPORT_DONE)
             if (
-                terminal_poc_outcome(stages.get(SimpleStage.POC_EXECUTION_DONE))
+                terminal_candidate_outcome(stages.get(SimpleStage.POC_CANDIDATE_DONE))
+                is not None
+                or terminal_poc_outcome(stages.get(SimpleStage.POC_EXECUTION_DONE))
                 is not None
                 or final is not None
                 and (
@@ -517,6 +523,7 @@ class SimpleAnalysisApplication:
                     StageCheckpoint(
                         identity=child,
                         stage=SimpleStage.PRO_CON_DONE,
+                        stage_version=STAGE_VERSION[SimpleStage.PRO_CON_DONE],
                         status=StageStatus.PENDING,
                         input_refs=inputs,
                         input_hash=input_reference_hash(inputs),
@@ -825,6 +832,7 @@ class SimpleAnalysisApplication:
                 StageCheckpoint(
                     identity=child,
                     stage=SimpleStage.PRO_CON_DONE,
+                    stage_version=STAGE_VERSION[SimpleStage.PRO_CON_DONE],
                     status=StageStatus.PENDING,
                     input_refs=inputs,
                     input_hash=input_reference_hash(inputs),
@@ -964,7 +972,16 @@ class SimpleAnalysisApplication:
         if failed.attempt_number >= MAX_RECOVERY_ATTEMPTS:
             self._store.mark_recovery_exhausted(failed)
             return False
-        resolution = await self._recovery_factory(failed.identity).decide(
+        try:
+            recovery = self._recovery_factory(failed.identity)
+        except ValueError as error:
+            # A missing provider cannot diagnose its own bootstrap failure.
+            # Keep the durable BLOCKED checkpoint instead of masking it with
+            # an unrelated CLI internal_error.
+            if str(error) == failure.code:
+                return False
+            raise
+        resolution = await recovery.decide(
             failed,
             failure,
         )
@@ -1005,6 +1022,7 @@ class SimpleAnalysisApplication:
         self._invalidate_stale_report_coverage(run, identity)
         latest_stage = SimpleStage.HYPOTHESIS_DONE
         incomplete: RunOutcome | None = None
+        inconclusive_candidate = False
         index = 0
         while index < len(run.hypothesis_ids):
             batch_ids = run.hypothesis_ids[
@@ -1027,6 +1045,14 @@ class SimpleAnalysisApplication:
             index += len(children)
             for child, outcome in zip(children, outcomes, strict=True):
                 latest_stage = outcome.current_stage
+                if (
+                    terminal_candidate_outcome(
+                        self._store.get(child, SimpleStage.POC_CANDIDATE_DONE)
+                    )
+                    is not None
+                ):
+                    inconclusive_candidate = True
+                    continue
                 if outcome.status in {StageStatus.BLOCKED, StageStatus.FAILED}:
                     if (
                         incomplete is None
@@ -1059,7 +1085,11 @@ class SimpleAnalysisApplication:
         return SimpleAnalysisOutcome(
             identity=identity,
             display_analysis_id=run.display_analysis_id,
-            status="PARTIAL" if run.static_disposition == "PARTIAL" else "COMPLETE",
+            status=(
+                "PARTIAL"
+                if run.static_disposition == "PARTIAL" or inconclusive_candidate
+                else "COMPLETE"
+            ),
             current_stage=latest_stage,
         )
 
@@ -1258,6 +1288,7 @@ class SimpleAnalysisApplication:
                 StageCheckpoint(
                     identity=child_identity,
                     stage=SimpleStage.PRO_CON_DONE,
+                    stage_version=STAGE_VERSION[SimpleStage.PRO_CON_DONE],
                     status=StageStatus.PENDING,
                     input_refs=inputs,
                     input_hash=input_reference_hash(inputs),

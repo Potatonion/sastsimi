@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -157,3 +158,64 @@ def test_escaped_source_never_truncates_prompt_artifact(tmp_path: Path) -> None:
         "path": "newlines.py",
         "reason": "PROMPT_BUDGET_EXHAUSTED",
     }
+
+
+def test_large_source_is_served_as_a_leading_excerpt(tmp_path: Path) -> None:
+    (tmp_path / "big.py").write_text("value = 1\n" * 400, encoding="utf-8")
+    (tmp_path / "small.py").write_text("x = 1\n", encoding="utf-8")
+
+    result = collect_requested_sources(
+        ("big.py", "small.py"),
+        workspace=tmp_path,
+        tracked=("big.py", "small.py"),
+        max_total_bytes=1_000,
+        max_file_bytes=400,
+        max_artifact_bytes=96_000,
+    )
+
+    served = {item["path"]: item for item in result["served"]}
+    assert served["big.py"]["excerpt"] is True
+    assert served["big.py"]["content"].endswith("\n")
+    assert len(served["big.py"]["content"]) <= 400
+    assert "excerpt" not in served["small.py"]
+    assert result["served_bytes"] <= 1_000
+    assert result["refused"] == []
+
+
+def test_pinned_blob_larger_than_budget_is_excerpted(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(("git", "init"), cwd=repo, check=True, capture_output=True)
+    (repo / "big.py").write_text("value = 1\n" * 200, encoding="utf-8")
+    subprocess.run(("git", "add", "big.py"), cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "init",
+        ),
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    commit = subprocess.check_output(
+        ("git", "rev-parse", "HEAD"), cwd=repo, text=True
+    ).strip()
+
+    result = collect_requested_sources(
+        ("big.py",),
+        workspace=repo,
+        tracked=("big.py",),
+        pinned_commit=commit,
+        max_total_bytes=2_000,
+        max_file_bytes=400,
+    )
+
+    assert result["served"][0]["excerpt"] is True
+    assert result["served_bytes"] <= 400
+    assert result["refused"] == []

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Protocol, TextIO
 
 from sastsimi.progress.models import ProgressSnapshot
@@ -33,17 +35,41 @@ class ProgressRenderer:
         width: int = 24,
         log_dir: Path | None = None,
         event_reader: Callable[[str], Iterable[ProgressEvent]] | None = None,
+        active_call_reader: Callable[[str], tuple[str, str, int] | None] | None = None,
     ) -> None:
         self._stream = stream
         self._is_tty = is_tty
         self._width = width
         self._log_dir = log_dir
         self._event_reader = event_reader
+        self._active_call_reader = active_call_reader
         self._seen_event_ids: set[str] = set()
         self._last_stage: str | None = None
+        self._last_snapshot: ProgressSnapshot | None = None
+        self._unchanged_since = monotonic()
+        self._last_wait_report = self._unchanged_since
 
     def render(self, snapshot: ProgressSnapshot) -> None:
         stage = snapshot.current_stage or "준비 중"
+        now = monotonic()
+        if snapshot != self._last_snapshot:
+            self._unchanged_since = now
+            self._last_wait_report = now
+        self._last_snapshot = snapshot
+        waiting = int(now - self._unchanged_since)
+        waiting_suffix = (
+            f" · 진척 변경 없이 대기 {waiting}초"
+            if snapshot.status == "RUNNING" and waiting >= 30
+            else ""
+        )
+        if waiting_suffix and self._active_call_reader is not None:
+            try:
+                active = self._active_call_reader(snapshot.analysis_id)
+            except (LookupError, OSError, ValueError, sqlite3.Error):
+                active = None
+            if active is not None:
+                agent, model, elapsed = active
+                waiting_suffix += f" · LLM {agent} / {model} 호출 {elapsed}초"
         self._append_log(snapshot, stage)
         self._render_new_events(snapshot.analysis_id)
         if not self._is_tty:
@@ -53,6 +79,10 @@ class ProgressRenderer:
                     f"({snapshot.completed_units}/{snapshot.known_units})\n"
                 )
                 self._last_stage = stage
+            elif waiting_suffix and now - self._last_wait_report >= 30:
+                self._stream.write(f"현재 단계: {stage}{waiting_suffix}\n")
+                self._last_wait_report = now
+            self._stream.flush()
             return
         filled = round(self._width * snapshot.percent / 100)
         bar = "█" * filled + "-" * (self._width - filled)
@@ -66,6 +96,7 @@ class ProgressRenderer:
         self._stream.write(
             f"\r{color}[{bar}] {snapshot.percent:3d}% "
             f"{snapshot.completed_units}/{snapshot.known_units} {stage}"
+            f"{waiting_suffix}"
             f"\033[0m{end}"
         )
         self._stream.flush()

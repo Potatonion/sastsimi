@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import re
 import sys
+import traceback
 from pathlib import Path
 from typing import Any, NoReturn, cast
 from uuid import uuid4
@@ -300,6 +301,10 @@ def main(
         allow_abbrev=False,
     )
     retry_parser.add_argument("analysis_id")
+    retry_parser.add_argument("--all-poc-timeouts", action="store_true")
+    retry_parser.add_argument("--rebuild-environment", action="store_true")
+    retry_parser.add_argument("--hypothesis-id", action="append", default=[])
+    retry_parser.add_argument("--allow-terminal-retry", action="store_true")
     retry_parser.add_argument("--format", choices=["text", "json"])
     results_parser = subparsers.add_parser(
         "results", help="read one terminal production result", allow_abbrev=False
@@ -570,7 +575,11 @@ def main(
             return int(ExitCode.OK)
         if args.command == "dashboard":
             command_name = "dashboard"
-            dashboard_command.run(config.data_dir, args.host, args.port)
+            try:
+                dashboard_command.run(config.data_dir, args.host, args.port)
+            except dashboard_command.DashboardConfigurationError as error:
+                sys.stderr.write(str(error) + "\n")
+                return int(ExitCode.CONFIG_ERROR)
             return int(ExitCode.OK)
         if args.command == "analyze":
             command_name = "analyze"
@@ -718,7 +727,25 @@ def main(
         if args.command == "retry":
             command_name = "retry"
             application = resolve_public_application()
-            data = application.retry(args.analysis_id)
+            if (
+                args.all_poc_timeouts and args.rebuild_environment
+                or args.hypothesis_id
+                and (args.all_poc_timeouts or args.rebuild_environment)
+                or args.allow_terminal_retry and not args.hypothesis_id
+            ):
+                raise _InputError
+            if args.hypothesis_id:
+                data = application.retry(
+                    args.analysis_id,
+                    hypothesis_ids=tuple(args.hypothesis_id),
+                    allow_terminal_retry=args.allow_terminal_retry,
+                )
+            elif args.rebuild_environment:
+                data = application.retry(args.analysis_id, rebuild_environment=True)
+            elif args.all_poc_timeouts:
+                data = application.retry(args.analysis_id, all_poc_timeouts=True)
+            else:
+                data = application.retry(args.analysis_id)
             public_command.emit_public(
                 output_format,
                 sys.stdout,
@@ -1066,7 +1093,18 @@ def main(
         logger.error(
             bootstrap.diagnostic_event(
                 "internal_error",
-                {"error_type": type(error).__name__},
+                {
+                    "error_type": type(error).__name__,
+                    # Frame names and line numbers identify the failing code
+                    # without logging exception messages, paths, or locals.
+                    "error_frames": [
+                        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                        for frame in traceback.extract_tb(error.__traceback__)[-6:]
+                        if Path(frame.filename)
+                        .resolve()
+                        .is_relative_to(Path(__file__).resolve().parents[2])
+                    ],
+                },
                 trace_id=trace_id,
             )
         )

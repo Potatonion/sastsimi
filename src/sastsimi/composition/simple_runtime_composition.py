@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 from collections.abc import Callable
@@ -41,6 +42,10 @@ from sastsimi.simple_runtime.application import (
     StaticBootstrapResult,
 )
 from sastsimi.simple_runtime.artifacts import SimpleArtifactRepository
+from sastsimi.simple_runtime.benchmark import (
+    StaticGroundTruthComparison,
+    build_benchmark_metrics,
+)
 from sastsimi.simple_runtime.bootstrap_stages import (
     DirectHypothesisBootstrap,
     DirectStaticBootstrap,
@@ -195,11 +200,19 @@ class SimpleClientFactory:
                 )
             cli_login = self._profile.auth_mode == "SUBSCRIPTION_LOGIN"
             transport = None
+            poc_transport = None
             if cli_login:
                 inspection = SystemToolDiscovery._inspect_cursor_agent()
                 if not inspection.available or inspection.executable is None:
                     raise ValueError("CURSOR_CLI_NOT_INSTALLED")
                 transport = OfficialCursorCLITransport(str(inspection.executable))
+                poc_transport = OfficialCursorCLITransport(
+                    str(inspection.executable),
+                    seed_prompt_sources=True,
+                    stream_json=True,
+                    trace_dir=artifacts.paths.logs,
+                    trace_label=str(identity.analysis_id),
+                )
             return CursorProvider(
                 artifacts=artifacts,
                 default_model=self._profile.model,
@@ -214,6 +227,7 @@ class SimpleClientFactory:
                 allow_on_demand=self._profile.cursor_allow_on_demand,
                 fallback=fallback,
                 transport=transport,
+                poc_transport=poc_transport,
                 use_cli_login=cli_login,
                 model_catalog=self._cursor_models,
             )
@@ -327,6 +341,7 @@ def build_analysis_application(
                 repository_url=repository_url,
                 workspace_path=static.workspace_path,
                 static_bundle_ref=static.static_bundle_ref,
+                llm_timeout_ms=profile.llm_timeout_seconds * 1000,
                 git_executable=(
                     str(profile.tools["git"].executable_path)
                     if "git" in profile.tools
@@ -361,6 +376,7 @@ def build_analysis_application(
             client_factory=client_factory,
             feed=profile.hypothesis_feed,
             store=store,
+            timeout_seconds=profile.llm_timeout_seconds,
         ),
         runner_factory=runner_factory,
         profile_ref=profile.provider_profile_ref,
@@ -455,53 +471,313 @@ class PublicSimpleRuntimeApplication(PublicCommandApplication):
             data["resume_skipped_reason"] = outcome.error_code
         return data
 
-    def retry(self, analysis_id: str) -> dict[str, object]:
+    def retry(
+        self,
+        analysis_id: str,
+        *,
+        all_poc_timeouts: bool = False,
+        rebuild_environment: bool = False,
+        hypothesis_ids: tuple[str, ...] = (),
+        allow_terminal_retry: bool = False,
+    ) -> dict[str, object]:
         exact = self._display.resolve(analysis_id)
         run = self._store.require_analysis_run(exact)
+        if (
+            (all_poc_timeouts or rebuild_environment) and hypothesis_ids
+            or allow_terminal_retry and not hypothesis_ids
+            or len(set(hypothesis_ids)) != len(hypothesis_ids)
+            or any(item not in run.hypothesis_ids for item in hypothesis_ids)
+        ):
+            raise ValueError("MANUAL_RETRY_TARGET_INVALID")
         current = self.status(run.display_analysis_id)
         current_hypothesis = current.get("current_hypothesis_id")
         current_stage = current.get("current_stage")
+        checkpoints = self._store.list_checkpoints(exact)
+        if rebuild_environment:
+            if all_poc_timeouts:
+                raise ValueError("RETRY_OPTIONS_CONFLICT")
+            candidate = next(
+                (
+                    item
+                    for item in checkpoints
+                    if item.stage is SimpleStage.POC_CANDIDATE_DONE
+                    and item.identity.hypothesis_id == current_hypothesis
+                ),
+                None,
+            )
+            initial = (
+                self._store.get(
+                    candidate.identity, SimpleStage.VERIFICATION_INITIAL_DONE
+                )
+                if candidate is not None
+                else None
+            )
+            recipe = None
+            if candidate is not None and candidate.recipe_ref is not None:
+                try:
+                    recipe = json.loads(
+                        SimpleArtifactRepository(
+                            self._config.data_dir, candidate.identity
+                        ).read(candidate.recipe_ref)
+                    )
+                except (OSError, ValueError):
+                    pass
+            if (
+                candidate is None
+                or initial is None
+                or initial.status.value != "SUCCEEDED"
+                or current_stage
+                not in {
+                    SimpleStage.POC_CANDIDATE_DONE.value,
+                    SimpleStage.POC_EXECUTION_DONE.value,
+                }
+                or not isinstance(recipe, dict)
+                or recipe.get("kind") != "simple_environment_recipe"
+                or recipe.get("degraded") is not True
+                or recipe.get("dockerfile_source") != "GENERATED_NO_INSTALL"
+            ):
+                return {
+                    **current,
+                    "retry_skipped_reason": "ENVIRONMENT_REBUILD_NOT_AVAILABLE",
+                }
+            backup_path = self._backup_for_retry(run.display_analysis_id)
+            self._store.invalidate_from(
+                candidate.identity,
+                SimpleStage.VERIFICATION_INITIAL_DONE,
+                new_inputs=initial.input_refs,
+                force=True,
+            )
+            return {
+                "analysis_id": run.display_analysis_id,
+                "exact_analysis_id": exact,
+                "status": "READY_TO_RESUME",
+                "current_stage": SimpleStage.VERIFICATION_INITIAL_DONE.value,
+                "hypothesis_id": candidate.identity.hypothesis_id,
+                "hypothesis_ids": [candidate.identity.hypothesis_id],
+                "retry_count": 1,
+                "retry_source_error": "DEGRADED_ENVIRONMENT",
+                "backup_path": backup_path.relative_to(
+                    self._config.data_dir
+                ).as_posix(),
+            }
+        timed_out_candidates = [
+            checkpoint
+            for checkpoint in checkpoints
+            if checkpoint.stage is SimpleStage.POC_CANDIDATE_DONE
+            and checkpoint.status.value == "BLOCKED"
+            and checkpoint.error_code == "CURSOR_TIMED_OUT"
+        ]
         blocked = next(
             (
                 checkpoint
-                for checkpoint in self._store.list_checkpoints(exact)
-                if checkpoint.status.value == "BLOCKED"
+                for checkpoint in checkpoints
+                if checkpoint.status.value in {"BLOCKED", "FAILED"}
                 and checkpoint.identity.hypothesis_id == current_hypothesis
                 and checkpoint.stage.value == current_stage
                 and (
-                    checkpoint.retryable
-                    or checkpoint.error_code == "RECOVERY_EXHAUSTED"
+                    checkpoint.status.value == "BLOCKED"
+                    and (
+                        checkpoint.retryable
+                        or checkpoint.error_code == "RECOVERY_EXHAUSTED"
+                    )
+                    or checkpoint.status.value == "FAILED"
+                    and checkpoint.error_code
+                    in {
+                        "CURSOR_INVALID_OUTPUT",
+                        "CURSOR_REQUEST_FAILED",
+                        "LLM_ELAPSED_BUDGET_EXHAUSTED",
+                    }
                 )
             ),
             None,
         )
-        if blocked is None:
+        if hypothesis_ids:
+            selected = []
+            for hypothesis_id in hypothesis_ids:
+                matching = [
+                    checkpoint
+                    for checkpoint in checkpoints
+                    if checkpoint.identity.hypothesis_id == hypothesis_id
+                    and (
+                        checkpoint.status.value == "FAILED"
+                        and checkpoint.error_code
+                        in {
+                            "CURSOR_INVALID_OUTPUT",
+                            "CURSOR_REQUEST_FAILED",
+                            "LLM_ELAPSED_BUDGET_EXHAUSTED",
+                        }
+                        or checkpoint.status.value == "BLOCKED"
+                        and (
+                            checkpoint.retryable
+                            or checkpoint.error_code
+                            in {
+                                "RECOVERY_EXHAUSTED",
+                                "POC_SOURCE_CONTEXT_UNAVAILABLE",
+                            }
+                        )
+                        or allow_terminal_retry
+                        and checkpoint.stage is SimpleStage.POC_CANDIDATE_DONE
+                        and checkpoint.status.value == "BLOCKED"
+                        and checkpoint.error_code == "POC_MODEL_REFUSED"
+                        or allow_terminal_retry
+                        and checkpoint.stage is SimpleStage.POC_CANDIDATE_DONE
+                        and checkpoint.status.value == "FAILED"
+                        and checkpoint.error_code == "CURSOR_MODEL_SAFETY_BLOCK"
+                        or allow_terminal_retry
+                        and checkpoint.stage is SimpleStage.REPORT_DONE
+                        and checkpoint.status.value == "FAILED"
+                        and checkpoint.error_code == "CURSOR_PROMPT_TOO_LARGE"
+                    )
+                ]
+                if len(matching) != 1:
+                    raise ValueError("MANUAL_RETRY_TARGET_NOT_ELIGIBLE")
+                selected.append(matching[0])
+        elif all_poc_timeouts:
+            selected = list(timed_out_candidates)
+        else:
+            selected = [
+                checkpoint
+                for checkpoint in checkpoints
+                if checkpoint.stage is SimpleStage.POC_CANDIDATE_DONE
+                and (
+                    checkpoint.status.value == "FAILED"
+                    and checkpoint.error_code
+                    in {
+                        "CURSOR_INVALID_OUTPUT",
+                        "CURSOR_REQUEST_FAILED",
+                        "LLM_ELAPSED_BUDGET_EXHAUSTED",
+                    }
+                    or checkpoint.status.value == "BLOCKED"
+                    and checkpoint.error_code
+                    in {
+                        "POC_SOURCE_CONTEXT_UNAVAILABLE",
+                        "RECOVERY_EXHAUSTED",
+                    }
+                )
+            ]
+            if blocked is not None and blocked not in selected:
+                selected.append(blocked)
+        selected = [checkpoint for checkpoint in selected if checkpoint is not None]
+        if not selected:
             return {
                 **current,
                 "retry_skipped_reason": "ANALYSIS_NOT_MANUALLY_RETRYABLE",
             }
 
-        backup_dir = self._store.database_path.parent / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        backup_name = f"sastsimi-before-retry-{run.display_analysis_id}-{stamp}.sqlite3"
-        backup_path = backup_dir / backup_name
-        with sqlite3.connect(self._store.database_path) as source:
-            with sqlite3.connect(backup_path) as destination:
-                source.backup(destination)
+        backup_path = self._backup_for_retry(run.display_analysis_id)
 
-        pending = self._store.reopen_for_manual_retry(blocked)
+        pending = []
+        for checkpoint in selected:
+            artifacts = SimpleArtifactRepository(
+                self._config.data_dir, checkpoint.identity
+            )
+            gate_ref = (
+                (checkpoint.input_refs[0],)
+                if checkpoint.gate_revision_count > 0 and checkpoint.input_refs
+                else ()
+            )
+            if checkpoint.stage is SimpleStage.POC_CANDIDATE_DONE:
+                previous_candidate = self._poc_record_ref(
+                    artifacts, checkpoint.input_refs, "simple_poc_candidate"
+                )
+                previous_execution = self._poc_record_ref(
+                    artifacts, checkpoint.input_refs, "simple_poc_execution"
+                )
+                if previous_candidate is not None and previous_execution is not None:
+                    pending.append(
+                        self._store.reopen_for_manual_retry(
+                            checkpoint,
+                            input_refs=(
+                                *gate_ref,
+                                previous_candidate[0],
+                                previous_execution[0],
+                            ),
+                            allow_terminal_retry=allow_terminal_retry,
+                        )
+                    )
+                    continue
+            candidate = (
+                self._store.get(
+                    checkpoint.identity, SimpleStage.POC_CANDIDATE_DONE
+                )
+                if checkpoint.stage is SimpleStage.POC_EXECUTION_DONE
+                else None
+            )
+            repair_inputs: tuple[StoredDataRef, ...] | None = None
+            if candidate is not None and candidate.status.value == "SUCCEEDED":
+                current_candidate = self._poc_record_ref(
+                    artifacts, candidate.output_refs, "simple_poc_candidate"
+                )
+                current_execution = self._poc_record_ref(
+                    artifacts, checkpoint.output_refs, "simple_poc_execution"
+                )
+                if (
+                    current_candidate is not None
+                    and current_execution is not None
+                    and current_execution[1].get("exit_code") == 2
+                    and current_execution[1].get("timed_out") is False
+                ):
+                    candidate_gate_ref = (
+                        (candidate.input_refs[0],)
+                        if candidate.gate_revision_count > 0 and candidate.input_refs
+                        else ()
+                    )
+                    repair_inputs = (
+                        *candidate_gate_ref,
+                        current_candidate[0],
+                        current_execution[0],
+                    )
+            pending.append(
+                self._store.reopen_poc_for_manual_repair(
+                    checkpoint, candidate, repair_input_refs=repair_inputs
+                )
+                if repair_inputs is not None and candidate is not None
+                else self._store.reopen_for_manual_retry(
+                    checkpoint, allow_terminal_retry=allow_terminal_retry
+                )
+            )
         return {
             "analysis_id": run.display_analysis_id,
             "exact_analysis_id": exact,
             "status": "READY_TO_RESUME",
-            "current_stage": pending.stage.value,
-            "hypothesis_id": pending.identity.hypothesis_id,
-            "attempt_number": pending.attempt_number,
-            "attempt_limit": pending.attempt_number + 1,
-            "retry_source_error": blocked.error_code,
+            "current_stage": pending[0].stage.value,
+            "hypothesis_id": pending[0].identity.hypothesis_id,
+            "hypothesis_ids": [
+                item.identity.hypothesis_id for item in pending
+            ],
+            "retry_count": len(pending),
+            "attempt_number": pending[0].attempt_number,
+            "attempt_limit": pending[0].attempt_number + 1,
+            "retry_source_error": selected[0].error_code,
             "backup_path": backup_path.relative_to(self._config.data_dir).as_posix(),
         }
+
+    @staticmethod
+    def _poc_record_ref(
+        artifacts: SimpleArtifactRepository,
+        refs: tuple[StoredDataRef, ...],
+        kind: str,
+    ) -> tuple[StoredDataRef, dict[str, object]] | None:
+        for ref in reversed(refs):
+            try:
+                record = json.loads(artifacts.read(ref))
+            except (OSError, ValueError):
+                continue
+            if isinstance(record, dict) and record.get("kind") == kind:
+                return ref, record
+        return None
+
+    def _backup_for_retry(self, display_analysis_id: str) -> Path:
+        backup_dir = self._store.database_path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = backup_dir / (
+            f"sastsimi-before-retry-{display_analysis_id}-{stamp}.sqlite3"
+        )
+        with sqlite3.connect(self._store.database_path) as source:
+            with sqlite3.connect(backup_path) as destination:
+                source.backup(destination)
+        return backup_path
 
     async def _track(
         self,
@@ -510,6 +786,7 @@ class PublicSimpleRuntimeApplication(PublicCommandApplication):
         callback: Callable[[ProgressSnapshot], None],
     ) -> SimpleAnalysisOutcome:
         last: ProgressSnapshot | None = None
+        last_emitted = asyncio.get_running_loop().time()
         while not task.done():
             if started:
                 try:
@@ -519,9 +796,13 @@ class PublicSimpleRuntimeApplication(PublicCommandApplication):
                     )
                 except LookupError:
                     current = None
-                if current is not None and current != last:
+                now = asyncio.get_running_loop().time()
+                if current is not None and (
+                    current != last or now - last_emitted >= 30
+                ):
                     callback(current)
                     last = current
+                    last_emitted = now
             await asyncio.sleep(0.2)
         outcome = await task
         if started:
@@ -572,6 +853,18 @@ class PublicSimpleRuntimeApplication(PublicCommandApplication):
         return {
             **self.status(run.display_analysis_id),
             "hypothesis_count": len(run.hypothesis_ids),
+            "static_detection_ref": (
+                run.static_bundle_ref.model_dump(mode="json")
+                if run.static_bundle_ref is not None
+                else None
+            ),
+            "benchmark_metrics": build_benchmark_metrics(
+                checkpoints=checkpoints,
+                static_detection_count=len(run.hypothesis_ids),
+                poc_attempt_statuses=self._store.llm_attempt_status_counts(
+                    exact, agent="poc_candidate"
+                ),
+            ),
             "finding_count": len(findings),
             "findings": [
                 FindingDisplayIdStore(self._store.database_path).get_or_allocate(
@@ -581,6 +874,28 @@ class PublicSimpleRuntimeApplication(PublicCommandApplication):
                 for checkpoint in findings
             ],
         }
+
+    def benchmark_result(
+        self,
+        analysis_id: str,
+        *,
+        static_comparison: StaticGroundTruthComparison,
+    ) -> dict[str, object]:
+        """Return the normal result plus grader-supplied static GT metrics."""
+
+        exact = self._display.resolve(analysis_id)
+        run = self._store.require_analysis_run(exact)
+        checkpoints = self._store.list_checkpoints(exact)
+        result = self.result(run.display_analysis_id)
+        result["benchmark_metrics"] = build_benchmark_metrics(
+            checkpoints=checkpoints,
+            static_detection_count=len(run.hypothesis_ids),
+            poc_attempt_statuses=self._store.llm_attempt_status_counts(
+                exact, agent="poc_candidate"
+            ),
+            static_comparison=static_comparison,
+        )
+        return result
 
     def poc(self, finding_id: str) -> str:
         identity, _finding_ref = self._finding_identity(finding_id)

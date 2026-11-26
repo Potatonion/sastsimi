@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import sqlite3
 import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +14,13 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .query import DashboardIncomplete, DashboardNotFound, DashboardQuery
+from .workspace import (
+    analysis_summary,
+    analysis_tab,
+    event_page,
+    llm_invocation,
+    status_cells,
+)
 
 _STATIC = Path(__file__).with_name("static")
 _CSP = (
@@ -30,6 +38,16 @@ def _loopback(host: str) -> bool:
         return False
 
 
+def _page_args(query: str, *, default_limit: int) -> tuple[int, int]:
+    parameters = parse_qs(query)
+    try:
+        offset = int(parameters.get("offset", ["0"])[0])
+        limit = int(parameters.get("limit", [str(default_limit)])[0])
+    except (TypeError, ValueError):
+        return 0, default_limit
+    return max(0, offset), min(max(limit, 1), 200)
+
+
 def create_server(
     data_dir: str | Path,
     *,
@@ -41,6 +59,7 @@ def create_server(
     if not 0 <= port <= 65535:
         raise ValueError("DASHBOARD_PORT_INVALID")
     query = DashboardQuery(data_dir)
+    query.check_database()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -95,6 +114,52 @@ def create_server(
                     )
                 elif parts == ("api", "analyses"):
                     self._json(query.list_analyses(), send_body)
+                elif parts == ("api", "meta"):
+                    self._json({"demo": False}, send_body)
+                elif (
+                    len(parts) == 4
+                    and parts[:2] == ("api", "analyses")
+                    and parts[3] == "summary"
+                ):
+                    self._json(analysis_summary(query, parts[2]), send_body)
+                elif (
+                    len(parts) == 4
+                    and parts[:2] == ("api", "analyses")
+                    and parts[3] == "status-cells"
+                ):
+                    offset, limit = _page_args(parsed.query, default_limit=100)
+                    self._json(
+                        status_cells(query, parts[2], offset=offset, limit=limit),
+                        send_body,
+                    )
+                elif (
+                    len(parts) == 4
+                    and parts[:2] == ("api", "analyses")
+                    and parts[3] == "event-page"
+                ):
+                    offset, limit = _page_args(parsed.query, default_limit=50)
+                    self._json(
+                        event_page(query, parts[2], offset=offset, limit=limit),
+                        send_body,
+                    )
+                elif (
+                    len(parts) == 5
+                    and parts[:2] == ("api", "analyses")
+                    and parts[3] == "tabs"
+                ):
+                    offset, limit = _page_args(parsed.query, default_limit=50)
+                    self._json(
+                        analysis_tab(
+                            query, parts[2], parts[4], offset=offset, limit=limit
+                        ),
+                        send_body,
+                    )
+                elif (
+                    len(parts) == 5
+                    and parts[:2] == ("api", "analyses")
+                    and parts[3] == "llm"
+                ):
+                    self._json(llm_invocation(query, parts[2], parts[4]), send_body)
                 elif (
                     len(parts) == 5
                     and parts[:2] == ("api", "analyses")
@@ -269,7 +334,7 @@ def create_server(
                     "application/json; charset=utf-8",
                     send_body,
                 )
-            except (OSError, ValueError, json.JSONDecodeError):
+            except (OSError, ValueError, sqlite3.Error):
                 self._response(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     b'{"error":"unavailable"}',

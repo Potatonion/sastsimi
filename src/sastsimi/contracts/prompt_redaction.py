@@ -211,7 +211,9 @@ def inspect_poc_candidate_json(data: bytes) -> RedactionResult:
     }
     inspected = redact_projected_json(canonical_bytes(protected))
     restored = inspected.data
-    for marker, path in protected_paths:
+    # Restore longer, later-numbered markers first: replacing marker 1 before
+    # marker 10 would corrupt the latter and silently alter a valid PoC script.
+    for marker, path in reversed(protected_paths):
         restored = restored.replace(marker, path)
     return RedactionResult(restored, inspected.categories)
 

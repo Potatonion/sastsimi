@@ -33,6 +33,13 @@ def emit_public(
         )
         return
     if command == "retry":
+        if data.get("retry_skipped_reason") == "ENVIRONMENT_REBUILD_NOT_AVAILABLE":
+            stream.write(
+                f"분석 ID: {data.get('analysis_id', '-')}\n"
+                "재빌드하지 않았습니다. 현재 가설에 설치 없는 이미지와 "
+                "완료된 초기 검증 기록이 필요합니다.\n"
+            )
+            return
         if data.get("retry_skipped_reason") == "ANALYSIS_NOT_MANUALLY_RETRYABLE":
             stream.write(
                 f"분석 ID: {data.get('analysis_id', '-')}\n"
@@ -42,9 +49,10 @@ def emit_public(
                 f"진행률: {data.get('percent', '-')}%\n"
             )
             return
+        retry_count = data.get("retry_count", 1)
         stream.write(
             f"분석 ID: {data.get('analysis_id', '-')}\n"
-            "수동 재시도 1회가 준비되었습니다.\n"
+            f"수동 재시도 {retry_count}회가 준비되었습니다.\n"
             f"대상 가설: {data.get('hypothesis_id', '-')}\n"
             f"재시작 단계: {data.get('current_stage', '-')}\n"
             f"DB 백업: {data.get('backup_path', '-')}\n"
@@ -79,6 +87,12 @@ def emit_public(
     if "finding_count" in data:
         stream.write(f"Finding: {data['finding_count']}개\n")
     if data.get("status") in {"BLOCKED", "FAILED"}:
+        if data.get("error_code") == "DOCKER_DAEMON_UNAVAILABLE":
+            stream.write(
+                "분석 환경에서 docker info가 성공하는지 확인한 뒤 "
+                "수동 재시도하세요.\n"
+            )
+            return
         if data.get("error_code") == "RECOVERY_EXHAUSTED":
             stream.write("자동 복구 한도에 도달해 수동 검토가 필요합니다.\n")
             return
