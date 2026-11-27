@@ -24,10 +24,42 @@ BUDGET_PAUSE_CODES = frozenset(
 )
 _DECISIONS = {"INCLUDE", "EXCLUDE", "UNDECIDED"}
 
+# A provider failure whose code carries one of these says the next batch would
+# fail the same way (credentials, configuration, rate or budget limits), so
+# continuing past it only spends calls. Anything else, such as one malformed or
+# interrupted response, is local to the batch that was in flight.
+_SYSTEMIC_FAILURE_FRAGMENTS = (
+    "AUTH",
+    "BUDGET",
+    "CONFIGURATION",
+    "CREDENTIAL",
+    "ISOLATION",
+    "MODEL_MISMATCH",
+    "PERMISSION",
+    "PLAN_LIMIT",
+    "RATE_LIMIT",
+    "UNSUPPORTED",
+    "USAGE_UNAVAILABLE",
+)
+# Batches that may fail in a row before Discovery stops as a whole. One bad
+# batch is isolated; a run of them means the provider is not usable right now.
+MAX_CONSECUTIVE_BATCH_FAILURES = 3
+
+
+def _systemic_failure(failure: StageFailure) -> bool:
+    return failure.code in BUDGET_PAUSE_CODES or any(
+        fragment in failure.code.upper() for fragment in _SYSTEMIC_FAILURE_FRAGMENTS
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class DiscoveryOutcome:
-    status: Literal["COMPLETE", "PAUSED", "ERROR"]
+    """``PARTIAL`` means every candidate was attempted but some are still
+    ``ERROR``. It is only returned to a caller that opted in with
+    ``tolerate_errors``; the unreviewed candidates stay visible as ``ERROR``.
+    """
+
+    status: Literal["COMPLETE", "PARTIAL", "PAUSED", "ERROR"]
     counts: dict[str, int]
     error_code: str | None = None
     evidence_refs: tuple[StoredDataRef, ...] = ()
@@ -63,10 +95,20 @@ class CandidateDiscovery:
         scope_fingerprint: str,
         *,
         retry_errors: bool = False,
+        tolerate_errors: bool = False,
+        max_consecutive_failures: int = MAX_CONSECUTIVE_BATCH_FAILURES,
     ) -> DiscoveryOutcome:
         # ERROR rows are attempted once on an explicit resume, not repeatedly
         # within the same run if the provider continues returning bad output.
+        #
+        # With ``tolerate_errors`` a provider failure that is local to one
+        # batch leaves that batch's candidates as ERROR and the run moves on to
+        # the next batch. The run still stops at once for a failure that would
+        # repeat (see ``_systemic_failure``) and after
+        # ``max_consecutive_failures`` failed batches in a row. Without the
+        # flag the first failure stops the run, as before.
         audit_refs: list[StoredDataRef] = []
+        consecutive_failures = 0
         if retry_errors:
             after_id: str | None = None
             while True:
@@ -83,16 +125,18 @@ class CandidateDiscovery:
                 failure = await self._process(
                     identity, scope_fingerprint, errors, audit_refs
                 )
-                if failure is not None:
-                    return DiscoveryOutcome(
-                        status=(
-                            "PAUSED" if failure.code in BUDGET_PAUSE_CODES else "ERROR"
-                        ),
-                        counts=self._store.candidate_counts(
-                            identity, scope_fingerprint
-                        ),
-                        error_code=failure.code,
-                        evidence_refs=tuple(audit_refs),
+                if failure is None:
+                    consecutive_failures = 0
+                    continue
+                consecutive_failures += 1
+                if self._must_stop(
+                    failure,
+                    tolerate_errors=tolerate_errors,
+                    consecutive_failures=consecutive_failures,
+                    max_consecutive_failures=max_consecutive_failures,
+                ):
+                    return self._failure_outcome(
+                        identity, scope_fingerprint, failure, audit_refs
                     )
         while True:
             pending = self._store.list_candidates(
@@ -100,24 +144,63 @@ class CandidateDiscovery:
             )
             if not pending:
                 counts = self._store.candidate_counts(identity, scope_fingerprint)
+                errored = bool(counts.get("ERROR", 0))
                 return DiscoveryOutcome(
-                    status="ERROR" if counts.get("ERROR", 0) else "COMPLETE",
+                    status=(
+                        "COMPLETE"
+                        if not errored
+                        else "PARTIAL"
+                        if tolerate_errors
+                        else "ERROR"
+                    ),
                     counts=counts,
-                    error_code="DISCOVERY_CANDIDATE_ERROR"
-                    if counts.get("ERROR", 0)
-                    else None,
+                    error_code="DISCOVERY_CANDIDATE_ERROR" if errored else None,
                     evidence_refs=tuple(audit_refs),
                 )
             failure = await self._process(
                 identity, scope_fingerprint, pending, audit_refs
             )
-            if failure is not None:
-                return DiscoveryOutcome(
-                    status="PAUSED" if failure.code in BUDGET_PAUSE_CODES else "ERROR",
-                    counts=self._store.candidate_counts(identity, scope_fingerprint),
-                    error_code=failure.code,
-                    evidence_refs=tuple(audit_refs),
+            if failure is None:
+                consecutive_failures = 0
+                continue
+            consecutive_failures += 1
+            if self._must_stop(
+                failure,
+                tolerate_errors=tolerate_errors,
+                consecutive_failures=consecutive_failures,
+                max_consecutive_failures=max_consecutive_failures,
+            ):
+                return self._failure_outcome(
+                    identity, scope_fingerprint, failure, audit_refs
                 )
+
+    @staticmethod
+    def _must_stop(
+        failure: StageFailure,
+        *,
+        tolerate_errors: bool,
+        consecutive_failures: int,
+        max_consecutive_failures: int,
+    ) -> bool:
+        return (
+            not tolerate_errors
+            or _systemic_failure(failure)
+            or consecutive_failures >= max_consecutive_failures
+        )
+
+    def _failure_outcome(
+        self,
+        identity: CheckpointIdentity,
+        scope_fingerprint: str,
+        failure: StageFailure,
+        audit_refs: list[StoredDataRef],
+    ) -> DiscoveryOutcome:
+        return DiscoveryOutcome(
+            status="PAUSED" if failure.code in BUDGET_PAUSE_CODES else "ERROR",
+            counts=self._store.candidate_counts(identity, scope_fingerprint),
+            error_code=failure.code,
+            evidence_refs=tuple(audit_refs),
+        )
 
     async def _process(
         self,
