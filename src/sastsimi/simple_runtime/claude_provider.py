@@ -159,9 +159,44 @@ def _child_environment(config_dir: Path, source: Mapping[str, str]) -> dict[str,
     return result
 
 
+def _require_structured_output_ack(
+    event: Mapping[str, Any], structured_tool_ids: set[str]
+) -> None:
+    """Accept only the client's own acknowledgement of the StructuredOutput call.
+
+    After a ``StructuredOutput`` tool call the official client reports the tool
+    result back to the model as a ``user`` event. That event is the client
+    talking to itself, not user input, but it must still be exactly that: a
+    result for a StructuredOutput call already seen in this stream and nothing
+    else. Any other ``user`` event (other tool ids, text content, an error
+    result, a sub-agent event) keeps failing the boundary.
+    """
+
+    message = event.get("message")
+    if (
+        not isinstance(message, dict)
+        or message.get("role") != "user"
+        or event.get("parent_tool_use_id") is not None
+    ):
+        raise ClaudeBoundaryError("CLAUDE_STREAM_INVALID")
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        raise ClaudeBoundaryError("CLAUDE_STREAM_INVALID")
+    for block in content:
+        if (
+            not isinstance(block, dict)
+            or block.get("type") != "tool_result"
+            or block.get("is_error") is True
+            or not isinstance(block.get("tool_use_id"), str)
+            or block["tool_use_id"] not in structured_tool_ids
+        ):
+            raise ClaudeBoundaryError("CLAUDE_STREAM_INVALID")
+
+
 def _parse_stream(raw: bytes, model: str) -> ClaudeCLIResponse:
     if not raw or len(raw) >= _MAX_STREAM_BYTES:
         raise ClaudeBoundaryError("CLAUDE_STREAM_INVALID")
+    structured_tool_ids: set[str] = set()
     state = "INIT"
     session: str | None = None
     result: dict[str, Any] | None = None
@@ -239,11 +274,15 @@ def _parse_stream(raw: bytes, model: str) -> ClaudeCLIResponse:
                     and block.get("name") != "StructuredOutput"
                 ):
                     raise ClaudeBoundaryError("CLAUDE_TOOL_FORBIDDEN")
+                if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                    structured_tool_ids.add(block["id"])
                 if (
                     message.get("model") == "<synthetic>"
                     and block.get("type") != "text"
                 ):
                     raise ClaudeBoundaryError("CLAUDE_TOOL_FORBIDDEN")
+        elif state == "TURN" and kind == "user":
+            _require_structured_output_ack(event, structured_tool_ids)
         elif state == "TURN" and kind == "result":
             if event.get("is_error") is not False:
                 status = event.get("api_error_status")
@@ -292,10 +331,28 @@ def _parse_stream(raw: bytes, model: str) -> ClaudeCLIResponse:
             else None
         )
 
+    def input_total() -> int | None:
+        # The client reports prompt-cache traffic separately from
+        # ``input_tokens``. It is still model input, so leaving it out makes the
+        # token ceiling and the usage ledger understate what a call consumed.
+        # A cache field that is present but invalid makes the total unknown
+        # rather than silently smaller.
+        total = token("input_tokens")
+        if total is None:
+            return None
+        for name in ("cache_creation_input_tokens", "cache_read_input_tokens"):
+            if name not in usage:
+                continue
+            part = token(name)
+            if part is None:
+                return None
+            total += part
+        return total
+
     return ClaudeCLIResponse(
         raw_output=raw,
         value=result,
-        input_tokens=token("input_tokens"),
+        input_tokens=input_total(),
         output_tokens=token("output_tokens"),
         cost_minor_units=(
             float(total_cost_usd) * 100 if total_cost_usd is not None else None
