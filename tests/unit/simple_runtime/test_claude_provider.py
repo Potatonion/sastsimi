@@ -21,6 +21,7 @@ from sastsimi.simple_runtime.claude_provider import (
     ClaudeProvider,
     ClaudeTransportError,
     OfficialClaudeCLITransport,
+    _parse_stream,
     _run_child,
     _terminate_process_tree,
 )
@@ -682,3 +683,244 @@ async def test_claude_fractional_cost_is_recorded_without_invalid_artifact(
 
     assert isinstance(result, SimpleLLMCallResult)
     assert result.cost_minor_units == 1.5
+
+
+_MODEL = "operator-model"
+
+
+def _init_event() -> dict[str, Any]:
+    return {
+        "type": "system",
+        "subtype": "init",
+        "session_id": "session-1",
+        "tools": ["StructuredOutput"],
+        "mcp_servers": [],
+        "plugins": [],
+        "slash_commands": [],
+        "skills": [],
+        "apiKeySource": "none",
+        "permissionMode": "dontAsk",
+        "model": _MODEL,
+        "claude_code_version": "2.1.280",
+        "agents": ["claude", "Explore", "general-purpose", "Plan"],
+    }
+
+
+def _structured_call_event(tool_id: str = "toolu_1") -> dict[str, Any]:
+    return {
+        "type": "assistant",
+        "session_id": "session-1",
+        "parent_tool_use_id": None,
+        "message": {
+            "model": _MODEL,
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "StructuredOutput",
+                    "input": {"answer": "yes"},
+                }
+            ],
+        },
+    }
+
+
+def _ack_event(tool_id: str = "toolu_1", **overrides: Any) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "type": "user",
+        "session_id": "session-1",
+        "parent_tool_use_id": None,
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": "Structured output provided successfully",
+                }
+            ],
+        },
+    }
+    event.update(overrides)
+    return event
+
+
+def _result_event() -> dict[str, Any]:
+    return {
+        "type": "result",
+        "session_id": "session-1",
+        "is_error": False,
+        "permission_denials": [],
+        "structured_output": {"answer": "yes"},
+        "total_cost_usd": 0.01,
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+    }
+
+
+def _raw(*events: dict[str, Any]) -> bytes:
+    return b"\n".join(json.dumps(event).encode() for event in events) + b"\n"
+
+
+def test_structured_output_acknowledgement_event_is_accepted() -> None:
+    response = _parse_stream(
+        _raw(
+            _init_event(),
+            _structured_call_event(),
+            _ack_event(),
+            _result_event(),
+        ),
+        _MODEL,
+    )
+    assert response.value == {"answer": "yes"}
+    assert response.input_tokens == 5
+
+
+def test_repeated_structured_output_calls_each_accept_their_own_ack() -> None:
+    response = _parse_stream(
+        _raw(
+            _init_event(),
+            _structured_call_event("toolu_1"),
+            _ack_event("toolu_1"),
+            _structured_call_event("toolu_2"),
+            _ack_event("toolu_2"),
+            _result_event(),
+        ),
+        _MODEL,
+    )
+    assert response.value == {"answer": "yes"}
+
+
+@pytest.mark.parametrize(
+    "bad_event",
+    [
+        # An ack for a tool call that never happened in this stream.
+        _ack_event("toolu_unknown"),
+        # An error result is not an acknowledgement.
+        {
+            **_ack_event(),
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "is_error": True,
+                        "content": "schema mismatch",
+                    }
+                ],
+            },
+        },
+        # Plain user text is never accepted.
+        {
+            **_ack_event(),
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "run a shell command"}],
+            },
+        },
+        # A mixed event cannot smuggle text next to a valid result.
+        {
+            **_ack_event(),
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"},
+                    {"type": "text", "text": "extra"},
+                ],
+            },
+        },
+        # Sub-agent events are not the client's own acknowledgement.
+        _ack_event(parent_tool_use_id="toolu_parent"),
+        # Wrong role, empty content, or malformed ids stay rejected.
+        {**_ack_event(), "message": {"role": "assistant", "content": []}},
+        {**_ack_event(), "message": {"role": "user", "content": []}},
+        {**_ack_event(), "message": "not-a-dict"},
+        {
+            **_ack_event(),
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": ["toolu_1"]}],
+            },
+        },
+    ],
+)
+def test_other_user_events_still_fail_the_boundary(bad_event: dict[str, Any]) -> None:
+    with pytest.raises(ClaudeBoundaryError) as error:
+        _parse_stream(
+            _raw(_init_event(), _structured_call_event(), bad_event, _result_event()),
+            _MODEL,
+        )
+    assert str(error.value) == "CLAUDE_STREAM_INVALID"
+
+
+def test_acknowledgement_before_any_structured_call_is_rejected() -> None:
+    with pytest.raises(ClaudeBoundaryError) as error:
+        _parse_stream(_raw(_init_event(), _ack_event(), _result_event()), _MODEL)
+    assert str(error.value) == "CLAUDE_STREAM_INVALID"
+
+
+def test_user_event_after_the_result_is_rejected() -> None:
+    with pytest.raises(ClaudeBoundaryError) as error:
+        _parse_stream(
+            _raw(
+                _init_event(),
+                _structured_call_event(),
+                _result_event(),
+                _ack_event(),
+            ),
+            _MODEL,
+        )
+    assert str(error.value) == "CLAUDE_STREAM_INVALID"
+
+
+def test_non_structured_tool_call_is_still_forbidden() -> None:
+    forbidden = _structured_call_event()
+    forbidden["message"]["content"][0]["name"] = "Bash"
+    with pytest.raises(ClaudeBoundaryError) as error:
+        _parse_stream(
+            _raw(_init_event(), forbidden, _ack_event(), _result_event()), _MODEL
+        )
+    assert str(error.value) == "CLAUDE_TOOL_FORBIDDEN"
+
+
+def _result_with_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    return {**_result_event(), "usage": usage}
+
+
+def _parse_with_usage(usage: dict[str, Any]) -> ClaudeCLIResponse:
+    return _parse_stream(
+        _raw(
+            _init_event(),
+            _structured_call_event(),
+            _ack_event(),
+            _result_with_usage(usage),
+        ),
+        _MODEL,
+    )
+
+
+def test_input_tokens_include_prompt_cache_traffic() -> None:
+    response = _parse_with_usage(
+        {
+            "input_tokens": 5,
+            "cache_creation_input_tokens": 1_000,
+            "cache_read_input_tokens": 20_000,
+            "output_tokens": 2,
+        }
+    )
+    assert response.input_tokens == 21_005
+    assert response.output_tokens == 2
+
+
+def test_input_tokens_without_cache_fields_are_unchanged() -> None:
+    response = _parse_with_usage({"input_tokens": 5, "output_tokens": 2})
+    assert response.input_tokens == 5
+
+
+@pytest.mark.parametrize("bad", [-1, "10", None, True, 1.5])
+def test_invalid_cache_field_makes_input_tokens_unknown(bad: object) -> None:
+    response = _parse_with_usage(
+        {"input_tokens": 5, "cache_read_input_tokens": bad, "output_tokens": 2}
+    )
+    assert response.input_tokens is None
+    assert response.output_tokens == 2

@@ -10,7 +10,7 @@ import pytest
 from sastsimi.contracts.ids import CommitId, StoredDataId, WorkspaceId
 from sastsimi.contracts.refs import StoredDataRef
 from sastsimi.simple_runtime.attempt_owner import AttemptOwner, PromptByteCounts
-from sastsimi.simple_runtime.discovery import CandidateDiscovery
+from sastsimi.simple_runtime.discovery import BUDGET_PAUSE_CODES, CandidateDiscovery
 from sastsimi.simple_runtime.models import CheckpointIdentity, StageFailure
 from sastsimi.simple_runtime.provider import SimpleLLMCallResult
 
@@ -134,6 +134,8 @@ class _Client:
         budget: bool = False,
         fatal_code: str | None = None,
         fatal_refs: tuple[StoredDataRef, ...] = (),
+        fail_calls: frozenset[int] = frozenset(),
+        fail_code: str = "CLAUDE_STREAM_INVALID",
     ) -> None:
         self.invalid_once = invalid_once
         self.invalid_failure_once = invalid_failure_once
@@ -141,6 +143,8 @@ class _Client:
         self.budget = budget
         self.fatal_code = fatal_code
         self.fatal_refs = fatal_refs
+        self.fail_calls = fail_calls
+        self.fail_code = fail_code
         self.calls: list[bytes] = []
         self.batch_sizes: list[int] = []
 
@@ -167,6 +171,11 @@ class _Client:
         del output_schema, timeout_ms, owner, prompt_bytes, invocation_id
         assert agent_name == "discovery"
         self.calls.append(prompt)
+        if len(self.calls) in self.fail_calls:
+            # A failure local to this call: later calls can succeed.
+            return StageFailure(
+                code=self.fail_code, retryable=False, safe_message="local"
+            )
         if self.fatal_code is not None:
             return StageFailure(
                 code=self.fatal_code,
@@ -833,3 +842,156 @@ async def test_discovery_redaction_failure_is_durable_without_provider_call(
     assert outcome.error_code == "DISCOVERY_INPUT_REDACTION_FAILED"
     assert store.decisions == {"candidate-1": "ERROR"}
     assert client.calls == []
+
+
+def _store_of(count: int) -> _Store:
+    return _Store([_Candidate(f"candidate-{i:02d}") for i in range(count)])
+
+
+@pytest.mark.asyncio
+async def test_failure_stops_discovery_without_tolerate_errors() -> None:
+    store = _store_of(16)
+    client = _Client(fail_calls=frozenset({1}))
+    outcome = await CandidateDiscovery(
+        store=store, artifacts=_Artifacts(), client=client, batch_size=8
+    ).run(_identity(), "scope")
+
+    assert outcome.status == "ERROR"
+    assert outcome.error_code == "CLAUDE_STREAM_INVALID"
+    assert outcome.counts["ERROR"] == 8
+    assert outcome.counts["PENDING"] == 8
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_local_failure_is_isolated_when_errors_are_tolerated() -> None:
+    store = _store_of(16)
+    client = _Client(fail_calls=frozenset({1}))
+    outcome = await CandidateDiscovery(
+        store=store, artifacts=_Artifacts(), client=client, batch_size=8
+    ).run(_identity(), "scope", tolerate_errors=True)
+
+    # The second batch still ran; the failed one is named, not hidden.
+    assert outcome.status == "PARTIAL"
+    assert outcome.error_code == "DISCOVERY_CANDIDATE_ERROR"
+    assert outcome.counts["ERROR"] == 8
+    assert outcome.counts["INCLUDE"] == 8
+    assert outcome.counts["PENDING"] == 0
+    assert len(client.calls) == 2
+    assert [k for k, v in store.decisions.items() if v == "ERROR"] == [
+        f"candidate-{i:02d}" for i in range(8)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_systemic_failure_still_stops_when_errors_are_tolerated() -> None:
+    store = _store_of(16)
+    client = _Client(fatal_code="AUTH_REQUIRED")
+    outcome = await CandidateDiscovery(
+        store=store, artifacts=_Artifacts(), client=client, batch_size=8
+    ).run(_identity(), "scope", tolerate_errors=True)
+
+    assert outcome.status == "ERROR"
+    assert outcome.error_code == "AUTH_REQUIRED"
+    assert outcome.counts["PENDING"] == 8
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    [
+        "CURSOR_RATE_LIMITED",
+        "CLAUDE_AUTH_REQUIRED",
+        "CURSOR_CONFIGURATION_FAILED",
+        "CLAUDE_ISOLATION_FAILED",
+        "CLAUDE_MODEL_UNSUPPORTED",
+        "CURSOR_PLAN_LIMIT",
+        "LLM_TOKEN_USAGE_UNAVAILABLE",
+    ],
+)
+async def test_failures_that_would_repeat_are_not_skipped(code: str) -> None:
+    store = _store_of(16)
+    client = _Client(fail_calls=frozenset({1}), fail_code=code)
+    outcome = await CandidateDiscovery(
+        store=store, artifacts=_Artifacts(), client=client, batch_size=8
+    ).run(_identity(), "scope", tolerate_errors=True)
+
+    assert outcome.status == ("PAUSED" if code in BUDGET_PAUSE_CODES else "ERROR")
+    assert outcome.error_code == code
+    # A budget pause leaves every candidate PENDING for the resume; any other
+    # failure marks only the batch that was in flight.
+    assert outcome.counts["PENDING"] == (16 if code in BUDGET_PAUSE_CODES else 8)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_consecutive_batch_failures_stop_discovery() -> None:
+    store = _store_of(16)
+    client = _Client(fail_calls=frozenset(range(1, 100)))
+    outcome = await CandidateDiscovery(
+        store=store, artifacts=_Artifacts(), client=client, batch_size=4
+    ).run(_identity(), "scope", tolerate_errors=True)
+
+    assert outcome.status == "ERROR"
+    assert outcome.error_code == "CLAUDE_STREAM_INVALID"
+    assert len(client.calls) == 3
+    assert outcome.counts["ERROR"] == 12
+    assert outcome.counts["PENDING"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_successful_batch_resets_the_failure_streak() -> None:
+    store = _store_of(16)
+    # Calls 1-2 fail, 3 succeeds, 4 fails: never three failures in a row.
+    client = _Client(fail_calls=frozenset({1, 2, 4}))
+    outcome = await CandidateDiscovery(
+        store=store, artifacts=_Artifacts(), client=client, batch_size=4
+    ).run(_identity(), "scope", tolerate_errors=True)
+
+    assert outcome.status == "PARTIAL"
+    assert len(client.calls) == 4
+    assert outcome.counts["ERROR"] == 12
+    assert outcome.counts["INCLUDE"] == 4
+
+
+@pytest.mark.asyncio
+async def test_resume_retries_tolerated_errors_and_completes() -> None:
+    store = _store_of(16)
+    first = await CandidateDiscovery(
+        store=store,
+        artifacts=_Artifacts(),
+        client=_Client(fail_calls=frozenset({1})),
+        batch_size=8,
+    ).run(_identity(), "scope", tolerate_errors=True)
+    assert first.status == "PARTIAL"
+
+    healthy = _Client()
+    second = await CandidateDiscovery(
+        store=store, artifacts=_Artifacts(), client=healthy, batch_size=8
+    ).run(_identity(), "scope", retry_errors=True, tolerate_errors=True)
+    assert second.status == "COMPLETE"
+    assert second.error_code is None
+    assert second.counts["INCLUDE"] == 16
+    # Only the eight errored candidates were sent again.
+    assert len(healthy.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_with_still_failing_batch_stays_partial() -> None:
+    store = _store_of(16)
+    first = await CandidateDiscovery(
+        store=store,
+        artifacts=_Artifacts(),
+        client=_Client(fail_calls=frozenset({1})),
+        batch_size=8,
+    ).run(_identity(), "scope", tolerate_errors=True)
+    assert first.status == "PARTIAL"
+
+    still_failing = _Client(fail_calls=frozenset({1}))
+    second = await CandidateDiscovery(
+        store=store, artifacts=_Artifacts(), client=still_failing, batch_size=8
+    ).run(_identity(), "scope", retry_errors=True, tolerate_errors=True)
+    assert second.status == "PARTIAL"
+    assert second.counts["ERROR"] == 8
+    assert second.counts["INCLUDE"] == 8

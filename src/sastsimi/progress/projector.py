@@ -820,6 +820,18 @@ class ProgressProjector:
         StageCheckpoint,
     ]:
         current = max(checkpoints, key=lambda item: item.updated_at)
+        # A candidate whose Discovery stayed ERROR is an open block, unless the
+        # run certified a PARTIAL result whose recorded counts include it. That
+        # terminal record names the unreviewed remainder, so it is shown as
+        # PARTIAL rather than as a stuck analysis. Hypothesis-level (deep)
+        # errors keep blocking either way.
+        decision_errors = (candidate_counts or {}).get("ERROR", 0)
+        if (
+            candidate_pipeline_version >= 2
+            and candidate_terminal_valid
+            and candidate_terminal_status == "PARTIAL"
+        ):
+            decision_errors = 0
         if candidate_pipeline_version >= 1:
             running = [
                 item for item in checkpoints if item.status is StageStatus.RUNNING
@@ -846,9 +858,7 @@ class ProgressProjector:
                 return "BLOCKED", _visible_child_error(
                     blocked, max(blocked, key=lambda item: item.updated_at)
                 )
-            if (candidate_counts or {}).get("ERROR", 0) or (
-                candidate_deep_counts or {}
-            ).get("ERROR", 0):
+            if decision_errors or (candidate_deep_counts or {}).get("ERROR", 0):
                 return "BLOCKED", current
             paused = [
                 item
@@ -869,7 +879,7 @@ class ProgressProjector:
                     ]
                     if (
                         operational
-                        or (candidate_counts or {}).get("ERROR", 0)
+                        or decision_errors
                         or (candidate_deep_counts or {}).get("ERROR", 0)
                     ):
                         return "BLOCKED", max(
@@ -883,7 +893,7 @@ class ProgressProjector:
             if candidate_counts is None:
                 return "RUNNING", current
             deep = candidate_deep_counts or {}
-            if candidate_counts.get("ERROR", 0) or deep.get("ERROR", 0):
+            if decision_errors or deep.get("ERROR", 0):
                 return "BLOCKED", current
             deep_eligible = candidate_counts.get("INCLUDE", 0) + candidate_counts.get(
                 "UNDECIDED", 0

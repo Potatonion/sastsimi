@@ -1785,3 +1785,95 @@ async def test_old_flask_nonretryable_checkpoint_is_not_reopened(
     assert second.error_code == "POC_ENVIRONMENT_UNVERIFIED"
     assert store.require(child, SimpleStage.POC_EXECUTION_DONE) == blocked
     assert dict(app.fixture_agent_calls) == before  # type: ignore[attr-defined]
+
+
+class _FlakyDiscoveryClient(_DiscoveryClient):
+    """Fails the first ``fail_first`` calls with a failure local to the batch."""
+
+    def __init__(self, fail_first: int, *, code: str = "CLAUDE_STREAM_INVALID") -> None:
+        super().__init__()
+        self.fail_first = fail_first
+        self.code = code
+        self.attempts = 0
+
+    async def call(  # type: ignore[override]
+        self,
+        *,
+        prompt: bytes,
+        output_schema: Mapping[str, Any],
+        timeout_ms: int,
+        agent_name: str = "agent",
+        owner: AttemptOwner | None = None,
+        prompt_bytes: PromptByteCounts | None = None,
+        invocation_id: str | None = None,
+    ) -> SimpleLLMCallResult | StageFailure:
+        self.attempts += 1
+        if self.attempts <= self.fail_first:
+            return StageFailure(
+                code=self.code, retryable=False, safe_message="batch-local failure"
+            )
+        return await super().call(
+            prompt=prompt,
+            output_schema=output_schema,
+            timeout_ms=timeout_ms,
+            agent_name=agent_name,
+            owner=owner,
+            prompt_bytes=prompt_bytes,
+            invocation_id=invocation_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_discovery_batch_failure_finishes_partial_and_resume_completes(
+    tmp_path: Path,
+) -> None:
+    app, store, _discovery, _proposer, _events, data_dir = _fixture(tmp_path)
+    flaky = _FlakyDiscoveryClient(fail_first=1)
+    app._candidate_client_factory = lambda *_: flaky
+
+    first = await app.analyze(_request(data_dir))
+
+    # The only Discovery batch failed. The analysis is not stuck: it finished,
+    # certified PARTIAL, and still names the three candidates nobody reviewed.
+    assert first.status == "PARTIAL", first.error_code
+    terminal = store.require_analysis_run(first.identity.analysis_id).candidate_terminal
+    assert terminal is not None
+    assert terminal.status == "PARTIAL"
+    assert terminal.decision_counts["ERROR"] == 3
+    assert terminal.decision_counts["INCLUDE"] == 0
+    status = _public_app(data_dir).status(first.display_analysis_id)
+    assert status["status"] == "PARTIAL"
+    assert status["candidate_total_count"] == 3
+
+    # Resume retries only those candidates and then completes normally.
+    second = await app.resume(first.identity.analysis_id)
+
+    assert second.status == "COMPLETE", second.error_code
+    assert flaky.attempts == 2
+    terminal = store.require_analysis_run(
+        second.identity.analysis_id
+    ).candidate_terminal
+    assert terminal is not None
+    assert terminal.status == "COMPLETE"
+    assert terminal.decision_counts["ERROR"] == 0
+    assert store.list_hypotheses(second.identity) == ("known-command-path",)
+    assert _public_app(data_dir).status(second.display_analysis_id)["status"] == (
+        "COMPLETE"
+    )
+
+
+@pytest.mark.asyncio
+async def test_systemic_discovery_failure_still_blocks_the_analysis(
+    tmp_path: Path,
+) -> None:
+    app, store, _discovery, _proposer, _events, data_dir = _fixture(tmp_path)
+    app._candidate_client_factory = lambda *_: _FlakyDiscoveryClient(
+        fail_first=99, code="CLAUDE_AUTH_REQUIRED"
+    )
+
+    outcome = await app.analyze(_request(data_dir))
+
+    assert outcome.status == "BLOCKED"
+    assert outcome.error_code == "CLAUDE_AUTH_REQUIRED"
+    run = store.require_analysis_run(outcome.identity.analysis_id)
+    assert run.candidate_terminal is None

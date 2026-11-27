@@ -7282,15 +7282,24 @@ class SimpleAnalysisApplication:
         else:
             checkpoint = prior
         client = self._candidate_client_factory(identity, artifacts)
+        # Only the v2 pipeline can certify a PARTIAL result that names its
+        # unreviewed candidates, so only v2 carries on past a Discovery batch
+        # that failed. An analysis resumed with such candidates still recorded
+        # retries them once, exactly like one that stopped on them.
+        tolerate_discovery_errors = run.candidate_pipeline_version == 2
         discovery = await CandidateDiscovery(
             store=self._store, artifacts=artifacts, client=client
         ).run(
             identity,
             scope,
             retry_errors=prior is not None
-            and prior.status in {StageStatus.BLOCKED, StageStatus.FAILED},
+            and (
+                prior.status in {StageStatus.BLOCKED, StageStatus.FAILED}
+                or bool(self._store.candidate_counts(identity, scope).get("ERROR", 0))
+            ),
+            tolerate_errors=tolerate_discovery_errors,
         )
-        if discovery.status != "COMPLETE":
+        if discovery.status not in {"COMPLETE", "PARTIAL"}:
             code = discovery.error_code or "DISCOVERY_INCOMPLETE"
             return self._candidate_bootstrap_failure(
                 run,
@@ -8194,9 +8203,12 @@ class SimpleAnalysisApplication:
         counts = self._store.candidate_counts(identity, scope)
         deep = self._store.candidate_deep_counts(identity, scope)
         pending = self._store.list_incomplete_hypotheses(identity, limit=1)
+        # A candidate whose Discovery stayed ERROR was never triaged. Every
+        # other candidate was reviewed, so the analysis can finish, but it can
+        # only certify PARTIAL (see terminal_status below) and the ERROR count
+        # stays in the terminal record as the named, unreviewed remainder.
         if (
             counts.get("PENDING", 0)
-            or counts.get("ERROR", 0)
             or any(deep.get(status, 0) for status in ("PENDING", "RUNNING", "ERROR"))
             or pending
         ):
@@ -8239,7 +8251,9 @@ class SimpleAnalysisApplication:
         }
         terminal_status: Literal["COMPLETE", "PARTIAL"] = (
             "COMPLETE"
-            if run.static_disposition == "FULL" and coverage.complete
+            if run.static_disposition == "FULL"
+            and coverage.complete
+            and not counts.get("ERROR", 0)
             else "PARTIAL"
         )
         terminal = CandidateTerminal(
